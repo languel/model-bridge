@@ -175,7 +175,7 @@ final class BridgeState {
                 ollamaRenderer = "qwen3.8"
                 ollamaParser = "qwen3.5"
                 ollamaCapabilities = "completion, tools, thinking"
-            } else if combined.contains("gemma4") {
+            } else if combined.contains("gemma4") && !combined.contains("humanizer") {
                 ollamaRenderer = "gemma4"
                 ollamaParser = ""
                 ollamaCapabilities = "completion"

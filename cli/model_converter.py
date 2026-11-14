@@ -70,7 +70,7 @@ def inspect_gguf(file_path: Path) -> Dict[str, Any]:
     info: Dict[str, Any] = {
         "format": "GGUF",
         "file_size_gb": round(file_path.stat().st_size / (1024**3), 2),
-        "path": str(file_path.resolve()),
+        "path": os.path.abspath(file_path),
         "architecture": "unknown",
         "name": file_path.stem,
         "n_tensors": 0,
@@ -667,6 +667,24 @@ def infer_ollama_card_defaults(info: Dict[str, Any]) -> Dict[str, Any]:
         "top_k": 30,
     }
 
+    if "humanizer" in combined or "humanizer" in str(info.get("path", "")).lower():
+        defaults["renderer"] = None
+        defaults["parser"] = None
+        defaults["capabilities"] = ["completion"]
+        defaults["temperature"] = 1.0
+        defaults["top_p"] = 0.95
+        defaults["top_k"] = 0
+        defaults["custom_template"] = (
+            '{{- $draft := .Prompt }}{{- range .Messages }}{{- if eq .Role "user" }}{{- $draft = .Content }}{{- end }}{{- end }}'
+            "Rewrite the text below so it reads like a person wrote it, not a language model.\n\n"
+            "Reorganize it as you see fit. Vary sentence length on purpose. Cut hedging,\n"
+            "throat-clearing, and any sentence that only announces what comes next.\n"
+            "Prefer the concrete word over the abstract one. It is fine to sound uneven.\n\n"
+            "Every fact, number, unit, date, name and quotation must survive unchanged.\n\n"
+            '{{ $draft }}\n\n### Rewritten:{{ "\\n\\n" }}'
+        )
+        return defaults
+
     if "qwen3_5" in combined or "qwen3.5" in combined:
         defaults["renderer"] = "qwen3.5"
         defaults["parser"] = "qwen3.5"
@@ -704,10 +722,15 @@ def build_modelfile(
 
     eff_renderer = renderer if renderer is not None else defaults["renderer"]
     eff_parser = parser_name if parser_name is not None else defaults["parser"]
+    if defaults.get("custom_template") and eff_renderer == "gemma4":
+        eff_renderer = None
+        eff_parser = None
     eff_caps = capabilities if capabilities is not None else defaults["capabilities"]
     eff_ctx = num_ctx if num_ctx is not None else defaults["num_ctx"]
     eff_temp = temperature if temperature is not None else defaults["temperature"]
 
+    if defaults.get("custom_template"):
+        lines.append(f'TEMPLATE """{defaults["custom_template"]}"""')
     if eff_renderer:
         lines.append(f"RENDERER {eff_renderer}")
     if eff_parser:
@@ -1202,6 +1225,31 @@ def convert_to_ollama_gguf(
             gguf_path.unlink(missing_ok=True)
 
 
+def _pick_hf_gguf_file(repo_id: str, target_quant: str) -> Optional[str]:
+    """Checks if a Hugging Face repo already hosts a matching or base .gguf file."""
+    q_upper = target_quant.upper()
+    try:
+        req = urllib.request.Request(
+            f"https://huggingface.co/api/models/{repo_id}",
+            headers={"User-Agent": "ModelBridge/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        siblings = [s.get("rfilename", "") for s in data.get("siblings", []) if s.get("rfilename", "").lower().endswith(".gguf")]
+        if not siblings:
+            return None
+        for f in siblings:
+            if q_upper in f.upper():
+                return f
+        for pref in ("BF16", "F16", "FP16", "Q8_0", "Q6_K"):
+            for f in siblings:
+                if pref in f.upper():
+                    return f
+        return siblings[0]
+    except Exception:
+        return None
+
+
 def quantize_gguf(source: str, target_quant: str = "Q4_K_M", output_file: Optional[str] = None) -> bool:
     """Quantizes a GGUF file, or chains HF Hub / Safetensors / MLX -> GGUF via llama.cpp convert_hf_to_gguf.py."""
     info = inspect_model(source)
@@ -1212,19 +1260,25 @@ def quantize_gguf(source: str, target_quant: str = "Q4_K_M", output_file: Option
     fmt = info.get("format", "")
     q_upper = (target_quant or "Q4_K_M").upper()
 
-    if fmt in ("HuggingFace Hub", "HuggingFace Safetensors", "MLX"):
+    if fmt == "HuggingFace Hub":
+        hf_spec = info["path"]
+        if "#" not in hf_spec:
+            picked = _pick_hf_gguf_file(info["repo_id"], q_upper)
+            if picked:
+                print(f"[*] Found pre-built GGUF '{picked}' in '{info['repo_id']}' — downloading single file instead of full repo...")
+                hf_spec = f"hf:{info['repo_id']}#{picked}"
+        print(f"[*] Resolving HuggingFace Hub source '{hf_spec}'...")
+        snap = resolve_hf_hub_snapshot(hf_spec)
+        if not snap:
+            return False
+        info = inspect_model(str(snap))
+        fmt = info.get("format", "")
+
+    if fmt in ("HuggingFace Safetensors", "MLX"):
         gguf_py, conv_script = _find_hf_to_gguf()
         if not gguf_py or not conv_script:
             print("[-] convert_hf_to_gguf.py not found in tools/llama_cpp_convert.", file=sys.stderr)
             return False
-
-        if fmt == "HuggingFace Hub":
-            print(f"[*] Resolving HuggingFace Hub snapshot for '{info['repo_id']}'...")
-            snap = resolve_hf_hub_snapshot(info["path"])
-            if not snap:
-                return False
-            info = inspect_model(str(snap))
-            fmt = info.get("format", "")
 
         src_path = Path(info["path"])
         clean_stem = (info.get("name") or src_path.stem).replace(":", "-").replace("/", "_")
@@ -1264,7 +1318,7 @@ def quantize_gguf(source: str, target_quant: str = "Q4_K_M", output_file: Option
                     print("[-] llama-quantize not found. Install via: brew install llama.cpp", file=sys.stderr)
                     return False
                 print(f"[*] Quantizing GGUF -> {q_upper} via llama-quantize...")
-                q_cmd = [llama_quantize_bin, str(raw_gguf), str(out_p), q_upper]
+                q_cmd = [llama_quantize_bin, "--allow-requantize", str(raw_gguf), str(out_p), q_upper]
                 print(f"[*] Running: {' '.join(q_cmd)}")
                 subprocess.run(q_cmd, check=True)
 
@@ -1293,6 +1347,15 @@ def quantize_gguf(source: str, target_quant: str = "Q4_K_M", output_file: Option
             out_p = cand / f"{src_path.stem}_{q_upper}.gguf"
         else:
             out_p = cand
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+
+    if q_upper in src_path.stem.upper():
+        print(f"[*] Source GGUF '{src_path.name}' is already {q_upper}; skipping re-quantization.")
+        if out_p.resolve() != src_path.resolve():
+            out_p.unlink(missing_ok=True)
+            os.symlink(src_path, out_p)
+        print(f"[+] GGUF ready at '{out_p}' ({round(src_path.stat().st_size / (1024**3), 2)} GB)!")
+        return True
 
     llama_quantize_bin = shutil.which("llama-quantize") or "/opt/homebrew/bin/llama-quantize"
     if not Path(llama_quantize_bin).exists():
@@ -1300,7 +1363,7 @@ def quantize_gguf(source: str, target_quant: str = "Q4_K_M", output_file: Option
         return False
 
     print(f"[*] Quantizing GGUF: {src_path.name} -> {q_upper}")
-    cmd = [llama_quantize_bin, str(src_path), str(out_p), q_upper]
+    cmd = [llama_quantize_bin, "--allow-requantize", str(src_path), str(out_p), q_upper]
 
     try:
         print(f"[*] Running: {' '.join(cmd)}")
