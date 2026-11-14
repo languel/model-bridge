@@ -797,6 +797,52 @@ def convert_to_ollama(
             modelfile_path.unlink()
 
 
+MLX_MODEL_TYPE_ALIASES = {
+    "gemma4_unified": "gemma4",
+    "gemma4_unified_text": "gemma4_text",
+}
+
+
+def _stage_mlx_compatible_dir(src_dir: Path) -> Optional[Path]:
+    """Creates a symlinked temp dir with patched config.json if model_type needs MLX aliasing."""
+    cfg_path = src_dir / "config.json"
+    if not cfg_path.exists():
+        return None
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    mtype = cfg.get("model_type")
+    text_cfg = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else None
+    text_mtype = text_cfg.get("model_type") if text_cfg else None
+
+    needs_patch = (mtype in MLX_MODEL_TYPE_ALIASES) or (text_mtype in MLX_MODEL_TYPE_ALIASES)
+    if not needs_patch:
+        return None
+
+    staged_dir = _register_temp_path(Path(f"/tmp/mlx_staged_{src_dir.name}"))
+    if staged_dir.exists():
+        shutil.rmtree(staged_dir, ignore_errors=True)
+    staged_dir.mkdir(parents=True, exist_ok=True)
+
+    for item in src_dir.iterdir():
+        if item.name == "config.json":
+            continue
+        (staged_dir / item.name).symlink_to(item)
+
+    if mtype in MLX_MODEL_TYPE_ALIASES:
+        cfg["model_type"] = MLX_MODEL_TYPE_ALIASES[mtype]
+    if text_cfg and text_mtype in MLX_MODEL_TYPE_ALIASES:
+        text_cfg["model_type"] = MLX_MODEL_TYPE_ALIASES[text_mtype]
+    if "vocab_size" not in cfg and text_cfg and "vocab_size" in text_cfg:
+        cfg["vocab_size"] = text_cfg["vocab_size"]
+
+    (staged_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    print(f"[*] Patched config.json model_type '{mtype}' -> '{cfg.get('model_type')}' for mlx-lm compatibility.")
+    return staged_dir
+
+
 def convert_to_mlx(source: str, output_dir: Optional[str] = None, q_bits: int = 4, q_group_size: int = 64) -> bool:
     """Converts HuggingFace Hub, Safetensors, or GGUF/Ollama (via Safetensors) to Apple Silicon Metal MLX format."""
     info = inspect_model(source)
@@ -828,6 +874,12 @@ def convert_to_mlx(source: str, output_dir: Optional[str] = None, q_bits: int = 
     if not output_dir:
         output_dir = default_out
 
+    staged_dir: Optional[Path] = None
+    if Path(hf_arg).is_dir():
+        staged_dir = _stage_mlx_compatible_dir(Path(hf_arg))
+        if staged_dir:
+            hf_arg = str(staged_dir)
+
     out_p = Path(output_dir).expanduser()
     step_prefix = "[*] Step 2/2:" if temp_hf_dir else "[*]"
     print(f"{step_prefix} Converting model -> MLX ({q_bits}-bit, group_size={q_group_size})")
@@ -852,8 +904,33 @@ def convert_to_mlx(source: str, output_dir: Optional[str] = None, q_bits: int = 
     else:
         cmd.extend(["--dtype", "bfloat16"])
 
+    if staged_dir is not None:
+        # Run mlx_lm.convert with patched gemma4.Model.sanitize for unified multimodal keys
+        mlx_py = "/opt/homebrew/Cellar/mlx-lm/0.31.3_2/libexec/bin/python"
+        if not Path(mlx_py).exists():
+            # Fallback: read shebang from mlx_lm.convert
+            try:
+                first_line = Path(mlx_convert_bin).read_text(encoding="utf-8", errors="ignore").splitlines()[0]
+                if first_line.startswith("#!"):
+                    mlx_py = first_line[2:].strip().split()[0]
+            except Exception:
+                mlx_py = sys.executable
+        wrapper_code = (
+            "import sys\n"
+            "import mlx_lm.models.gemma4 as g4\n"
+            "from mlx_lm.convert import main\n"
+            "_orig = g4.Model.sanitize\n"
+            "def _patched(self, w):\n"
+            "    f = {k: v for k, v in w.items() if not k.removeprefix('model.').startswith(('vision_embedder', 'audio_embedder'))}\n"
+            "    return _orig(self, f)\n"
+            "g4.Model.sanitize = _patched\n"
+            "sys.argv = ['mlx_lm.convert'] + sys.argv[1:]\n"
+            "main()\n"
+        )
+        cmd = [mlx_py, "-c", wrapper_code] + cmd[1:]
+
     try:
-        print(f"[*] Running: {' '.join(cmd)}")
+        print(f"[*] Running: {' '.join(cmd if staged_dir is None else [mlx_convert_bin] + cmd[3:])}")
         subprocess.run(cmd, check=True)
         print(f"[+] Successfully converted to MLX at '{out_p}'!")
         return True
@@ -863,6 +940,8 @@ def convert_to_mlx(source: str, output_dir: Optional[str] = None, q_bits: int = 
     finally:
         if temp_hf_dir and temp_hf_dir.exists():
             shutil.rmtree(temp_hf_dir, ignore_errors=True)
+        if staged_dir and staged_dir.exists():
+            shutil.rmtree(staged_dir, ignore_errors=True)
 
 
 def convert_to_ollama_mlx(

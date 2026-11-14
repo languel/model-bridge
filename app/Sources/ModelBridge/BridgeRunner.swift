@@ -379,7 +379,7 @@ final class BridgeState {
         createdOutputPathOnStart = nil
 
         if let tmpItems = try? fm.contentsOfDirectory(atPath: "/tmp") {
-            let prefixes = ["hf_from_gguf_", "hf_dequant_", "ollama_mlx_", "Modelfile_"]
+            let prefixes = ["hf_from_gguf_", "hf_dequant_", "ollama_mlx_", "mlx_staged_", "Modelfile_"]
             for item in tmpItems where prefixes.contains(where: { item.hasPrefix($0) }) {
                 try? fm.removeItem(atPath: "/tmp/\(item)")
             }
