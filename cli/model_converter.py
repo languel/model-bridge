@@ -17,14 +17,46 @@ Unified interface bridging:
 """
 
 import argparse
+import atexit
 import json
 import os
 import shutil
+import signal
 import struct
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+_TEMP_CLEANUP_PATHS: List[Path] = []
+
+
+def _register_temp_path(p: Path) -> Path:
+    if p not in _TEMP_CLEANUP_PATHS:
+        _TEMP_CLEANUP_PATHS.append(p)
+    return p
+
+
+def _cleanup_temp_paths() -> None:
+    for p in list(_TEMP_CLEANUP_PATHS):
+        try:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            elif p.is_file():
+                p.unlink(missing_ok=True)
+        except Exception:
+            pass
+    _TEMP_CLEANUP_PATHS.clear()
+
+
+def _handle_sigterm(signum, frame):
+    _cleanup_temp_paths()
+    raise KeyboardInterrupt(f"Terminated by signal {signum}")
+
+
+atexit.register(_cleanup_temp_paths)
+signal.signal(signal.SIGTERM, _handle_sigterm)
+signal.signal(signal.SIGINT, _handle_sigterm)
 
 LM_STUDIO_MODELS_DIR = Path.home() / ".lmstudio" / "models"
 GGUF_MAGIC = b"GGUF"
@@ -738,7 +770,7 @@ def convert_to_ollama(
         print(f"    {line}")
     print("-" * 50)
 
-    modelfile_path = Path(f"/tmp/Modelfile_{model_name.replace(':', '_').replace('/', '_')}")
+    modelfile_path = _register_temp_path(Path(f"/tmp/Modelfile_{model_name.replace(':', '_').replace('/', '_')}"))
     modelfile_path.write_text(modelfile_content, encoding="utf-8")
 
     try:
@@ -766,30 +798,39 @@ def convert_to_ollama(
 
 
 def convert_to_mlx(source: str, output_dir: Optional[str] = None, q_bits: int = 4, q_group_size: int = 64) -> bool:
-    """Converts HuggingFace Safetensors model to Apple Silicon Metal MLX format."""
+    """Converts HuggingFace Hub, Safetensors, or GGUF/Ollama (via Safetensors) to Apple Silicon Metal MLX format."""
     info = inspect_model(source)
     if "error" in info:
         print(f"[-] Error inspecting source: {info['error']}", file=sys.stderr)
         return False
 
-    if info.get("format") == "GGUF":
-        print("[-] GGUF -> MLX direct conversion is lossy and unsupported for quantized GGUF.", file=sys.stderr)
-        print("    Apple Silicon best practice: convert from the source HuggingFace repository or unquantized safetensors.", file=sys.stderr)
-        return False
+    fmt = info.get("format", "")
+    temp_hf_dir: Optional[Path] = None
 
-    if info.get("format") == "HuggingFace Hub":
+    if fmt in ("GGUF", "Ollama (GGUF)"):
+        base_name = (info.get("name") or Path(info.get("path", "model")).stem).replace(":", "-").replace("/", "_")
+        temp_hf_dir = _register_temp_path(Path(f"/tmp/hf_from_gguf_{base_name}"))
+        print(f"[*] Step 1/2: Extracting {fmt} -> temporary Safetensors at '{temp_hf_dir}'...")
+        if not convert_to_safetensors(source, output_dir=str(temp_hf_dir), dtype="bfloat16"):
+            return False
+        info = inspect_model(str(temp_hf_dir))
+        fmt = info.get("format", "")
+
+    if fmt == "HuggingFace Hub":
         hf_arg = info["repo_id"]
         default_out = str(Path.home() / "ModelExports" / f"{info['name']}-mlx-{q_bits}bit")
     else:
         src_path = Path(info["path"])
         hf_arg = str(src_path)
-        default_out = str(src_path.parent / f"{src_path.name}-mlx-{q_bits}bit")
+        clean_stem = src_path.stem.replace(":", "-")
+        default_out = str(Path.home() / "ModelExports" / f"{clean_stem}-mlx-{q_bits}bit") if temp_hf_dir else str(src_path.parent / f"{src_path.name}-mlx-{q_bits}bit")
 
     if not output_dir:
         output_dir = default_out
 
     out_p = Path(output_dir).expanduser()
-    print(f"[*] Converting HuggingFace model -> MLX ({q_bits}-bit, group_size={q_group_size})")
+    step_prefix = "[*] Step 2/2:" if temp_hf_dir else "[*]"
+    print(f"{step_prefix} Converting model -> MLX ({q_bits}-bit, group_size={q_group_size})")
     print(f"    Source: {hf_arg}")
     print(f"    Destination: {out_p}")
 
@@ -797,16 +838,19 @@ def convert_to_mlx(source: str, output_dir: Optional[str] = None, q_bits: int = 
     mlx_convert_bin = shutil.which("mlx_lm.convert") or "/opt/homebrew/bin/mlx_lm.convert"
     if not Path(mlx_convert_bin).exists():
         print(f"[-] mlx_lm.convert executable not found at '{mlx_convert_bin}'. Install via: brew install mlx-lm", file=sys.stderr)
+        if temp_hf_dir and temp_hf_dir.exists():
+            shutil.rmtree(temp_hf_dir, ignore_errors=True)
         return False
 
     cmd = [
         mlx_convert_bin,
         "--hf-path", hf_arg,
         "--mlx-path", str(out_p),
-        "-q",
-        "--q-bits", str(q_bits),
-        "--q-group-size", str(q_group_size),
     ]
+    if q_bits in (4, 8):
+        cmd.extend(["-q", "--q-bits", str(q_bits), "--q-group-size", str(q_group_size)])
+    else:
+        cmd.extend(["--dtype", "bfloat16"])
 
     try:
         print(f"[*] Running: {' '.join(cmd)}")
@@ -816,6 +860,82 @@ def convert_to_mlx(source: str, output_dir: Optional[str] = None, q_bits: int = 
     except subprocess.CalledProcessError as e:
         print(f"[-] MLX conversion failed: {e}", file=sys.stderr)
         return False
+    finally:
+        if temp_hf_dir and temp_hf_dir.exists():
+            shutil.rmtree(temp_hf_dir, ignore_errors=True)
+
+
+def convert_to_ollama_mlx(
+    source: str,
+    model_name: Optional[str] = None,
+    q_bits: int = 4,
+    output_dir: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    num_ctx: Optional[int] = None,
+    temperature: Optional[float] = None,
+    renderer: Optional[str] = None,
+    parser_name: Optional[str] = None,
+    capabilities: Optional[List[str]] = None,
+    move_source: bool = False,
+) -> bool:
+    """Chains any source (HF Hub, Safetensors, GGUF, Ollama, MLX) -> MLX -> Ollama MLX."""
+    info = inspect_model(source)
+    if "error" in info:
+        print(f"[-] Error inspecting source: {info['error']}", file=sys.stderr)
+        return False
+
+    fmt = info.get("format", "unknown")
+    resolved_source = source
+
+    if fmt == "HuggingFace Hub":
+        print(f"[*] Step 1/3: Resolving HuggingFace Hub snapshot for '{info['repo_id']}'...")
+        snap = resolve_hf_hub_snapshot(info["repo_id"])
+        if not snap:
+            return False
+        resolved_source = str(snap)
+        info = inspect_model(resolved_source)
+        fmt = info.get("format", "unknown")
+
+    if fmt == "MLX":
+        print("[*] Source is already MLX; registering directly in Ollama...")
+        return convert_to_ollama(
+            resolved_source,
+            model_name=model_name,
+            system_prompt=system_prompt,
+            num_ctx=num_ctx,
+            temperature=temperature,
+            renderer=renderer,
+            parser_name=parser_name,
+            capabilities=capabilities,
+            move_source=move_source,
+        )
+
+    raw_name = (model_name or info.get("name") or Path(info.get("path", "model")).stem)
+    safe_dir_name = raw_name.replace(":", "-").replace("/", "_")
+    mlx_dir = Path(output_dir).expanduser() if output_dir else _register_temp_path(Path(f"/tmp/ollama_mlx_{safe_dir_name}-{q_bits}bit"))
+    temp_mlx = output_dir is None
+
+    print(f"[*] Step 2/3: Converting {fmt} -> Apple Silicon MLX ({q_bits}-bit)...")
+    if not convert_to_mlx(resolved_source, output_dir=str(mlx_dir), q_bits=q_bits):
+        return False
+
+    target_name = model_name or f"{safe_dir_name.lower()}-mlx"
+    print(f"[*] Step 3/3: Registering MLX model '{target_name}' in Ollama...")
+    try:
+        return convert_to_ollama(
+            str(mlx_dir),
+            model_name=target_name,
+            system_prompt=system_prompt,
+            num_ctx=num_ctx,
+            temperature=temperature,
+            renderer=renderer,
+            parser_name=parser_name,
+            capabilities=capabilities,
+            move_source=move_source and not temp_mlx,
+        )
+    finally:
+        if temp_mlx and mlx_dir.exists():
+            shutil.rmtree(mlx_dir, ignore_errors=True)
 
 
 def quantize_gguf(source: str, target_quant: str = "Q4_K_M", output_file: Optional[str] = None) -> bool:
@@ -1042,17 +1162,17 @@ def convert_to_onnx(source: str, output_dir: Optional[str] = None, onnx_quant: s
         info = inspect_model(str(snap))
         fmt = info.get("format", "")
 
-    if fmt == "MLX":
-        src_path = Path(info["path"])
-        temp_hf_dir = Path(f"/tmp/hf_dequant_{src_path.name}")
-        print(f"[*] Source is MLX. Auto-dequantizing to temporary Safetensors at '{temp_hf_dir}' first...")
+    if fmt in ("MLX", "GGUF", "Ollama (GGUF)"):
+        base_name = (info.get("name") or Path(info.get("path", "model")).stem).replace(":", "-").replace("/", "_")
+        temp_hf_dir = _register_temp_path(Path(f"/tmp/hf_dequant_{base_name}"))
+        print(f"[*] Step 1/2: Extracting {fmt} -> temporary Safetensors at '{temp_hf_dir}'...")
         if not convert_to_safetensors(source, output_dir=str(temp_hf_dir), dtype="float16"):
             return False
         info = inspect_model(str(temp_hf_dir))
         fmt = info.get("format", "")
 
     if fmt != "HuggingFace Safetensors":
-        print(f"[-] ONNX export requires HuggingFace Hub, Safetensors, or MLX source (got {fmt}).", file=sys.stderr)
+        print(f"[-] ONNX export requires HuggingFace Hub, Safetensors, MLX, or GGUF/Ollama source (got {fmt}).", file=sys.stderr)
         return False
 
     src_path = Path(info["path"])
@@ -1187,7 +1307,7 @@ Examples:
     # Convert
     convert_parser = subparsers.add_parser("convert", help="Convert model between formats")
     convert_parser.add_argument("source", help="Source model file, HF directory, LM Studio ID, or 'ollama:<name>'")
-    convert_parser.add_argument("--to", required=True, choices=["ollama", "mlx", "onnx", "gguf", "safetensors", "lmstudio"], help="Target format")
+    convert_parser.add_argument("--to", required=True, choices=["ollama", "ollama-mlx", "mlx", "onnx", "gguf", "safetensors", "lmstudio"], help="Target format")
     convert_parser.add_argument("--name", help="Model name for Ollama")
     convert_parser.add_argument("--bits", type=int, default=4, choices=[4, 8, 16], help="Quantization bits for MLX (default: 4)")
     convert_parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"], help="Target dtype for Safetensors export")
@@ -1269,7 +1389,7 @@ Examples:
 
     elif args.command == "convert":
         ok = False
-        if args.source.startswith("ollama:"):
+        if args.source.startswith("ollama:") and args.to in ("lmstudio", "gguf", "safetensors", "ollama"):
             ol_name = args.source.replace("ollama:", "", 1)
             if args.to == "lmstudio":
                 ok = export_ollama_model(ol_name, to_lmstudio=True, move=args.move)
@@ -1278,12 +1398,27 @@ Examples:
             elif args.to == "safetensors":
                 ok = convert_to_safetensors(args.source, output_dir=args.output, dtype=args.dtype)
             else:
-                print(f"[-] Direct Ollama -> {args.to} conversion is not supported. Export to Safetensors, GGUF, or Archive first.", file=sys.stderr)
+                print(f"[-] Direct Ollama -> {args.to} conversion is not supported. Use 'ollama-mlx' to convert to Ollama MLX, or export to Safetensors/GGUF.", file=sys.stderr)
         elif args.to == "ollama":
             caps = [c.strip() for c in args.capabilities.split(",")] if args.capabilities else None
             ok = convert_to_ollama(
                 args.source,
                 model_name=args.name,
+                system_prompt=args.system,
+                num_ctx=args.ctx,
+                temperature=args.temp,
+                renderer=args.renderer,
+                parser_name=args.parser_name,
+                capabilities=caps,
+                move_source=args.move,
+            )
+        elif args.to == "ollama-mlx":
+            caps = [c.strip() for c in args.capabilities.split(",")] if args.capabilities else None
+            ok = convert_to_ollama_mlx(
+                args.source,
+                model_name=args.name,
+                q_bits=args.bits,
+                output_dir=args.output,
                 system_prompt=args.system,
                 num_ctx=args.ctx,
                 temperature=args.temp,

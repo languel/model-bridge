@@ -196,12 +196,13 @@ struct ContentView: View {
 
     private var detailView: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 14) {
                 sourceCard
                 targetCard
                 consoleCard
             }
-            .padding(20)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 14)
         }
         .background(Color(nsColor: .windowBackgroundColor))
     }
@@ -312,8 +313,22 @@ struct ContentView: View {
 
                 // Dynamic target options
                 switch state.targetFormat {
-                case .ollama:
+                case .ollama, .ollamaMLX:
                     Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+                        if state.targetFormat == .ollamaMLX {
+                            GridRow {
+                                Text("MLX Precision")
+                                    .frame(width: 100, alignment: .trailing)
+                                    .foregroundStyle(.secondary)
+                                Picker("Bits", selection: $state.mlxBits) {
+                                    Text("4-bit (Fastest)").tag(4)
+                                    Text("8-bit (Balanced)").tag(8)
+                                    Text("16-bit (BF16)").tag(16)
+                                }
+                                .pickerStyle(.segmented)
+                                .labelsHidden()
+                            }
+                        }
                         GridRow {
                             Text("Model Name")
                                 .frame(width: 100, alignment: .trailing)
@@ -527,6 +542,32 @@ struct ContentView: View {
                     .padding(8)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                }
+
+                if state.status == .running {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text(state.progressMessage.isEmpty ? "Running conversion…" : state.progressMessage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Spacer()
+                            if let frac = state.progressFraction {
+                                Text("\(Int(frac * 100))%")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        if let frac = state.progressFraction {
+                            ProgressView(value: frac)
+                                .progressViewStyle(.linear)
+                        } else {
+                            ProgressView()
+                                .progressViewStyle(.linear)
+                        }
+                    }
+                    .padding(10)
+                    .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
                 }
 
                 HStack {

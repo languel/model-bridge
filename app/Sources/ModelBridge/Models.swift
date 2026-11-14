@@ -2,6 +2,7 @@ import Foundation
 
 enum TargetFormat: String, CaseIterable, Identifiable {
     case ollama = "ollama"
+    case ollamaMLX = "ollama-mlx"
     case mlx = "mlx"
     case gguf = "gguf"
     case safetensors = "safetensors"
@@ -14,6 +15,7 @@ enum TargetFormat: String, CaseIterable, Identifiable {
     var displayName: String {
         switch self {
         case .ollama: return "Ollama"
+        case .ollamaMLX: return "Ollama MLX"
         case .mlx: return "MLX"
         case .gguf: return "GGUF"
         case .safetensors: return "Safetensors"
@@ -26,10 +28,11 @@ enum TargetFormat: String, CaseIterable, Identifiable {
     var subtitle: String {
         switch self {
         case .ollama: return "Import GGUF, MLX, or HF Safetensors into Ollama with a full Model Card"
-        case .mlx: return "Apple Silicon Metal native weights (4/8/16-bit)"
+        case .ollamaMLX: return "Chain any model (HF, Safetensors, GGUF, Ollama) -> MLX -> Ollama MLX"
+        case .mlx: return "Apple Silicon Metal native weights (4/8/16-bit) — chains HF, Safetensors, GGUF, or Ollama"
         case .gguf: return "Quantize GGUF via llama-quantize, or extract GGUF from Ollama"
         case .safetensors: return "Export MLX or BF16/F16/Q8 GGUF to Hugging Face Safetensors"
-        case .onnx: return "Browser WebGPU causal LM (q4f16) — supports HF Safetensors & MLX"
+        case .onnx: return "Browser WebGPU causal LM (q4f16) — chains HF, Safetensors, MLX, GGUF, or Ollama"
         case .lmstudio: return "Export Ollama model directly into LM Studio (~/.lmstudio/models)"
         case .archive: return "Copy or move model (with Modelfile/weights) to a backup or external drive"
         }

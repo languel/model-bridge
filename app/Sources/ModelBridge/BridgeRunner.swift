@@ -38,10 +38,13 @@ final class BridgeState {
 
     var status: ConversionStatus = .idle
     var logOutput: String = ""
+    var progressFraction: Double? = nil
+    var progressMessage: String = ""
     var isRefreshing: Bool = false
     var isInspecting: Bool = false
 
     private var activeProcess: Process?
+    private var createdOutputPathOnStart: String?
 
     /// Resolves the path to `cli/model_converter.py`.
     var cliScriptPath: String {
@@ -71,16 +74,13 @@ final class BridgeState {
     var compatibilityWarning: String? {
         guard let fmt = inspectedModel?.format else { return nil }
         if sourcePath.hasPrefix("ollama:") {
-            if targetFormat == .ollama || targetFormat == .mlx || targetFormat == .onnx {
-                return "To export an Ollama model, select Safetensors, GGUF, LM Studio, or Archive."
+            if targetFormat == .ollama {
+                return "Source is already in Ollama. Select Ollama MLX to convert to MLX, or export to Safetensors, GGUF, ONNX, LM Studio, or Archive."
             }
             if targetFormat == .lmstudio && inspectedModel?.has_single_gguf == false {
                 return "This Ollama model uses split MLX/Safetensors layers. Exporting will create a portable bundle rather than a single GGUF."
             }
             return nil
-        }
-        if fmt == "GGUF" && (targetFormat == .mlx || targetFormat == .onnx) {
-            return "Export to Safetensors first (supported for BF16/F16/Q8 GGUF), or use a Hugging Face Safetensors folder."
         }
         if fmt == "MLX" && targetFormat == .gguf {
             return "MLX weights are already quantized. Export to Safetensors first, or use an unquantized Hugging Face Safetensors folder."
@@ -103,8 +103,8 @@ final class BridgeState {
     func selectSource(_ path: String) {
         self.sourcePath = path
         if path.hasPrefix("ollama:") {
-            if targetFormat == .ollama || targetFormat == .mlx || targetFormat == .onnx {
-                targetFormat = .archive
+            if targetFormat == .ollama {
+                targetFormat = .ollamaMLX
             }
         } else {
             let base = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
@@ -190,7 +190,14 @@ final class BridgeState {
             args.append(contentsOf: ["convert", sourcePath, "--to", targetFormat.rawValue])
 
             switch targetFormat {
-            case .ollama:
+            case .ollama, .ollamaMLX:
+                if targetFormat == .ollamaMLX {
+                    args.append(contentsOf: ["--bits", String(mlxBits)])
+                    let out = customOutputPath.trimmingCharacters(in: .whitespaces)
+                    if !out.isEmpty {
+                        args.append(contentsOf: ["--output", out])
+                    }
+                }
                 if !ollamaModelName.trimmingCharacters(in: .whitespaces).isEmpty {
                     args.append(contentsOf: ["--name", ollamaModelName.trimmingCharacters(in: .whitespaces)])
                 }
@@ -256,6 +263,14 @@ final class BridgeState {
 
     private func runStreaming(args: [String]) {
         status = .running
+        progressFraction = nil
+        progressMessage = "Starting…"
+        let outTrimmed = customOutputPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !outTrimmed.isEmpty && !FileManager.default.fileExists(atPath: outTrimmed) {
+            createdOutputPathOnStart = outTrimmed
+        } else {
+            createdOutputPathOnStart = nil
+        }
         logOutput = "$ python3 \(args.dropFirst().joined(separator: " "))\n\n"
 
         let process = Process()
@@ -276,7 +291,9 @@ final class BridgeState {
             let data = handle.availableData
             guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
             Task { @MainActor [weak self] in
-                self?.logOutput.append(chunk)
+                guard let self else { return }
+                self.logOutput.append(chunk)
+                self.parseProgress(from: chunk)
             }
         }
 
@@ -286,6 +303,11 @@ final class BridgeState {
                 guard let self else { return }
                 self.activeProcess = nil
                 self.status = proc.terminationStatus == 0 ? .success : .failed
+                self.progressFraction = proc.terminationStatus == 0 ? 1.0 : nil
+                if proc.terminationStatus == 0 {
+                    self.progressMessage = "Completed"
+                }
+                self.createdOutputPathOnStart = nil
                 self.logOutput.append("\n[Process exited with code \(proc.terminationStatus)]\n")
                 if proc.terminationStatus == 0 {
                     await self.refreshAll()
@@ -299,15 +321,69 @@ final class BridgeState {
         } catch {
             self.activeProcess = nil
             self.status = .failed
+            self.progressFraction = nil
+            self.progressMessage = "Failed to launch"
             self.logOutput.append("Failed to launch process: \(error.localizedDescription)\n")
         }
     }
 
+    private func parseProgress(from chunk: String) {
+        let lines = chunk.components(separatedBy: CharacterSet.newlines)
+        for raw in lines {
+            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+
+            // Match percentage like "45%|" or " 72%"
+            if let range = line.range(of: #"\b(\d{1,3})%"#, options: .regularExpression),
+               let pct = Int(line[range].dropLast()), (0...100).contains(pct) {
+                self.progressFraction = Double(pct) / 100.0
+            }
+
+            // Match Step X/Y
+            if let stepRange = line.range(of: #"Step\s+(\d+)/(\d+)"#, options: .regularExpression) {
+                let sub = String(line[stepRange])
+                let nums = sub.components(separatedBy: CharacterSet.decimalDigits.inverted).compactMap(Int.init)
+                if nums.count == 2, nums[1] > 0 {
+                    self.progressFraction = max(0.05, Double(nums[0] - 1) / Double(nums[1]))
+                }
+            }
+
+            if line.hasPrefix("[*]") {
+                self.progressMessage = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+            } else if line.hasPrefix("[+]") {
+                self.progressMessage = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+            }
+        }
+    }
+
     func stopConversion() {
-        activeProcess?.terminate()
+        if let proc = activeProcess {
+            let pid = proc.processIdentifier
+            proc.terminate()
+            // Also signal child process group if present
+            kill(-pid, SIGTERM)
+        }
         activeProcess = nil
         status = .failed
-        logOutput.append("\n[Cancelled by user]\n")
+        progressFraction = nil
+        progressMessage = "Cancelled & cleaned up"
+        cleanupUnfinishedArtifacts()
+        logOutput.append("\n[Cancelled by user — unfinished temporary/partial outputs cleaned up]\n")
+    }
+
+    private func cleanupUnfinishedArtifacts() {
+        let fm = FileManager.default
+        if let outPath = createdOutputPathOnStart, fm.fileExists(atPath: outPath) {
+            try? fm.removeItem(atPath: outPath)
+        }
+        createdOutputPathOnStart = nil
+
+        if let tmpItems = try? fm.contentsOfDirectory(atPath: "/tmp") {
+            let prefixes = ["hf_from_gguf_", "hf_dequant_", "ollama_mlx_", "Modelfile_"]
+            for item in tmpItems where prefixes.contains(where: { item.hasPrefix($0) }) {
+                try? fm.removeItem(atPath: "/tmp/\(item)")
+            }
+        }
     }
 
     func deleteOllamaModel(_ name: String) async {
