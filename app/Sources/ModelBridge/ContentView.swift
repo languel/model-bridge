@@ -438,6 +438,21 @@ struct ContentView: View {
                             TextField("Optional system instruction", text: $state.ollamaSystemPrompt)
                                 .textFieldStyle(.roundedBorder)
                         }
+                        if state.targetFormat == .ollama {
+                            GridRow {
+                                Text("Quantize")
+                                    .frame(width: 100, alignment: .trailing)
+                                    .foregroundStyle(.secondary)
+                                Picker("Ollama Quant", selection: $state.ollamaQuant) {
+                                    Text("Original (BF16/F16)").tag("")
+                                    Text("Q4_K_M").tag("Q4_K_M")
+                                    Text("Q5_K_M").tag("Q5_K_M")
+                                    Text("Q8_0").tag("Q8_0")
+                                }
+                                .pickerStyle(.segmented)
+                                .labelsHidden()
+                            }
+                        }
                         GridRow {
                             Text("")
                                 .frame(width: 100)

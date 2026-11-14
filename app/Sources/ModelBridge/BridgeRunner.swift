@@ -25,6 +25,7 @@ final class BridgeState {
     var ollamaRenderer: String = ""
     var ollamaParser: String = ""
     var ollamaCapabilities: String = "completion"
+    var ollamaQuant: String = "Q4_K_M"
     var moveToOllama: Bool = false
     var moveToArchive: Bool = false
     var archiveDir: String = UserDefaults.standard.string(forKey: "archiveDir") ?? (NSHomeDirectory() + "/ModelArchive") {
@@ -213,6 +214,9 @@ final class BridgeState {
                 }
                 if !ollamaCapabilities.trimmingCharacters(in: .whitespaces).isEmpty {
                     args.append(contentsOf: ["--capabilities", ollamaCapabilities.trimmingCharacters(in: .whitespaces)])
+                }
+                if targetFormat == .ollama && !ollamaQuant.isEmpty {
+                    args.append(contentsOf: ["--quant", ollamaQuant])
                 }
                 if moveToOllama {
                     args.append("--move")
