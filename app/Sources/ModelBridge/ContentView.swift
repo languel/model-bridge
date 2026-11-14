@@ -445,9 +445,10 @@ struct ContentView: View {
                                     .foregroundStyle(.secondary)
                                 Picker("Ollama Quant", selection: $state.ollamaQuant) {
                                     Text("Original (BF16/F16)").tag("")
-                                    Text("Q4_K_M").tag("Q4_K_M")
-                                    Text("Q5_K_M").tag("Q5_K_M")
-                                    Text("Q8_0").tag("Q8_0")
+                                    Text("INT4").tag("int4")
+                                    Text("INT8").tag("int8")
+                                    Text("MXFP4").tag("mxfp4")
+                                    Text("NVFP4").tag("nvfp4")
                                 }
                                 .pickerStyle(.segmented)
                                 .labelsHidden()

@@ -25,7 +25,7 @@ final class BridgeState {
     var ollamaRenderer: String = ""
     var ollamaParser: String = ""
     var ollamaCapabilities: String = "completion"
-    var ollamaQuant: String = "Q4_K_M"
+    var ollamaQuant: String = "int4"
     var moveToOllama: Bool = false
     var moveToArchive: Bool = false
     var archiveDir: String = UserDefaults.standard.string(forKey: "archiveDir") ?? (NSHomeDirectory() + "/ModelArchive") {

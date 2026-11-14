@@ -784,7 +784,11 @@ def convert_to_ollama(
     try:
         cmd = ["ollama", "create", model_name, "-f", str(modelfile_path)]
         if quant and quant.lower() not in ("original", "none", "as-is", "") and fmt == "HuggingFace Safetensors":
-            cmd.extend(["-q", quant.upper()])
+            q_val = quant.lower()
+            # Map GGUF quant names to Ollama's safetensors --quantize names if passed
+            q_map = {"q4_k_m": "int4", "q4_0": "int4", "q5_k_m": "int4", "q8_0": "int8"}
+            q_val = q_map.get(q_val, q_val)
+            cmd.extend(["-q", q_val])
         print(f"[*] Executing: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
         print(f"[+] Successfully registered '{model_name}' in Ollama!")
