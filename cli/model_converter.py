@@ -148,10 +148,71 @@ def inspect_hf_or_mlx(dir_path: Path) -> Dict[str, Any]:
     return info
 
 
+def is_hf_repo_id(target: str) -> bool:
+    """Returns True if target looks like a Hugging Face repo ID ('owner/repo' or 'hf:owner/repo')."""
+    clean = target.replace("hf:", "", 1).strip()
+    if clean.startswith("/") or clean.startswith("~") or clean.startswith("."):
+        return False
+    parts = clean.split("/")
+    return len(parts) == 2 and all(bool(p) and not p.endswith(".gguf") for p in parts)
+
+
+def inspect_hf_hub(repo_id: str) -> Dict[str, Any]:
+    """Fetches config.json from Hugging Face Hub without downloading weights."""
+    import urllib.request
+    clean_id = repo_id.replace("hf:", "", 1).strip()
+    url = f"https://huggingface.co/{clean_id}/resolve/main/config.json"
+    info: Dict[str, Any] = {
+        "format": "HuggingFace Hub",
+        "path": f"hf:{clean_id}",
+        "repo_id": clean_id,
+        "name": clean_id.split("/")[-1],
+    }
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "model-bridge/1.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            cfg = json.loads(resp.read().decode("utf-8"))
+        info["architecture"] = cfg.get("architectures", [cfg.get("model_type", "unknown")])[0]
+        info["model_type"] = cfg.get("model_type", "unknown")
+        info["torch_dtype"] = cfg.get("torch_dtype", "unknown")
+        info["vocab_size"] = cfg.get("vocab_size", "unknown")
+        if "quantization" in cfg or "quantization_config" in cfg:
+            qcfg = cfg.get("quantization") or cfg.get("quantization_config")
+            info["quantization"] = qcfg if isinstance(qcfg, dict) else {}
+    except Exception as e:
+        info["error"] = f"Could not fetch HuggingFace config for '{clean_id}': {e}"
+    return info
+
+
+def resolve_hf_hub_snapshot(repo_id: str) -> Optional[Path]:
+    """Downloads (or resolves cached) Hugging Face repo snapshot via huggingface_hub."""
+    clean_id = repo_id.replace("hf:", "", 1).strip()
+    mlx_py = "/opt/homebrew/Cellar/mlx-lm/0.31.3_2/libexec/bin/python"
+    py_exec = mlx_py if Path(mlx_py).exists() else sys.executable
+    print(f"[*] Resolving Hugging Face Hub repo '{clean_id}' (downloading/caching snapshot)...")
+    code = (
+        "import sys; "
+        "from huggingface_hub import snapshot_download; "
+        "print(snapshot_download(repo_id=sys.argv[1]))"
+    )
+    res = subprocess.run([py_exec, "-c", code, clean_id], capture_output=True, text=True)
+    if res.returncode == 0:
+        out_path = res.stdout.strip().splitlines()[-1].strip()
+        p = Path(out_path)
+        if p.is_dir():
+            print(f"[+] Snapshot ready at: {p}")
+            return p
+    print(f"[-] Failed to download HF repo '{clean_id}': {res.stderr}", file=sys.stderr)
+    return None
+
+
 def inspect_model(target: str) -> Dict[str, Any]:
-    """Inspect any model path, file, Ollama model ('ollama:<name>'), or LM Studio identifier."""
+    """Inspect any model path, file, Ollama model ('ollama:<name>'), HF repo ('owner/repo'), or LM Studio ID."""
     if target.startswith("ollama:"):
         return inspect_ollama_model(target.replace("ollama:", "", 1))
+
+    if target.startswith("hf:"):
+        return inspect_hf_hub(target)
 
     p = Path(target).expanduser()
     if p.is_file() and p.suffix.lower() == ".gguf":
@@ -170,7 +231,11 @@ def inspect_model(target: str) -> Dict[str, Any]:
             return inspect_gguf(lm_p)
         return inspect_hf_or_mlx(lm_p)
 
-    return {"error": f"Path '{target}' not found."}
+    # Check HuggingFace Hub ID (owner/repo)
+    if is_hf_repo_id(target):
+        return inspect_hf_hub(target)
+
+    return {"error": f"Path or repo '{target}' not found."}
 
 
 # =====================================================================
@@ -627,8 +692,15 @@ def convert_to_ollama(
         print(f"[-] Error inspecting source: {info['error']}", file=sys.stderr)
         return False
 
-    src_path = Path(info["path"])
     fmt = info.get("format", "unknown")
+    if fmt == "HuggingFace Hub":
+        snap = resolve_hf_hub_snapshot(info["repo_id"])
+        if not snap:
+            return False
+        info = inspect_model(str(snap))
+        fmt = info.get("format", "unknown")
+
+    src_path = Path(info["path"])
 
     if fmt not in ("GGUF", "MLX", "HuggingFace Safetensors"):
         print(f"[-] Unsupported source format '{fmt}' for Ollama import.", file=sys.stderr)
@@ -699,13 +771,20 @@ def convert_to_mlx(source: str, output_dir: Optional[str] = None, q_bits: int = 
         print("    Apple Silicon best practice: convert from the source HuggingFace repository or unquantized safetensors.", file=sys.stderr)
         return False
 
-    src_path = Path(info["path"])
-    if not output_dir:
-        output_dir = str(src_path.parent / f"{src_path.name}-mlx-{q_bits}bit")
+    if info.get("format") == "HuggingFace Hub":
+        hf_arg = info["repo_id"]
+        default_out = str(Path.home() / "ModelExports" / f"{info['name']}-mlx-{q_bits}bit")
+    else:
+        src_path = Path(info["path"])
+        hf_arg = str(src_path)
+        default_out = str(src_path.parent / f"{src_path.name}-mlx-{q_bits}bit")
 
-    out_p = Path(output_dir)
+    if not output_dir:
+        output_dir = default_out
+
+    out_p = Path(output_dir).expanduser()
     print(f"[*] Converting HuggingFace model -> MLX ({q_bits}-bit, group_size={q_group_size})")
-    print(f"    Source: {src_path}")
+    print(f"    Source: {hf_arg}")
     print(f"    Destination: {out_p}")
 
     # Use homebrew mlx_lm.convert binary if available
@@ -716,7 +795,7 @@ def convert_to_mlx(source: str, output_dir: Optional[str] = None, q_bits: int = 
 
     cmd = [
         mlx_convert_bin,
-        "--hf-path", str(src_path),
+        "--hf-path", hf_arg,
         "--mlx-path", str(out_p),
         "-q",
         "--q-bits", str(q_bits),
@@ -771,6 +850,13 @@ def convert_to_safetensors(source: str, output_dir: Optional[str] = None, dtype:
         return False
 
     fmt = info.get("format", "")
+    if fmt == "HuggingFace Hub":
+        snap = resolve_hf_hub_snapshot(info["repo_id"])
+        if not snap:
+            return False
+        info = inspect_model(str(snap))
+        fmt = info.get("format", "")
+
     src_path_str = info.get("path")
     if not src_path_str:
         print(f"[-] Cannot resolve file path for source '{source}'.", file=sys.stderr)
@@ -937,11 +1023,18 @@ print(f"Saved {len(out_tensors)} tensors to {out_dir / 'model.safetensors'}")
     return False
 
 
-def convert_to_onnx(source: str, output_dir: Optional[str] = None) -> bool:
-    """Exports HuggingFace Safetensors (or MLX via auto-dequantize) to ONNX causal LM (q4f16 format)."""
+def convert_to_onnx(source: str, output_dir: Optional[str] = None, onnx_quant: str = "q4f16") -> bool:
+    """Exports HuggingFace Safetensors, HuggingFace Hub, or MLX (auto-dequantized) to ONNX with optional quantization."""
     info = inspect_model(source)
     fmt = info.get("format", "")
     temp_hf_dir: Optional[Path] = None
+
+    if fmt == "HuggingFace Hub":
+        snap = resolve_hf_hub_snapshot(info["repo_id"])
+        if not snap:
+            return False
+        info = inspect_model(str(snap))
+        fmt = info.get("format", "")
 
     if fmt == "MLX":
         src_path = Path(info["path"])
@@ -953,17 +1046,18 @@ def convert_to_onnx(source: str, output_dir: Optional[str] = None) -> bool:
         fmt = info.get("format", "")
 
     if fmt != "HuggingFace Safetensors":
-        print(f"[-] ONNX WebGPU export requires HuggingFace Safetensors or MLX source (got {fmt}).", file=sys.stderr)
+        print(f"[-] ONNX export requires HuggingFace Hub, Safetensors, or MLX source (got {fmt}).", file=sys.stderr)
         return False
 
     src_path = Path(info["path"])
     model_type = info.get("model_type", "").lower()
 
     if not output_dir:
-        output_dir = str(src_path.parent / f"{src_path.name}-ONNX-q4f16")
+        base_name = (info.get("name") or src_path.name).replace(":", "-")
+        output_dir = str(Path.home() / "ModelExports" / f"{base_name}-ONNX-{onnx_quant}")
     out_p = Path(output_dir).expanduser()
 
-    print(f"[*] Exporting HuggingFace ({model_type}) -> WebGPU ONNX q4f16 format at '{out_p}'")
+    print(f"[*] Exporting HuggingFace ({model_type}) -> ONNX ({onnx_quant}) at '{out_p}'")
 
     script_dir = Path(__file__).resolve().parent
     threecoder_scripts = Path.home() / "dev" / "threecoder" / "scripts"
@@ -976,7 +1070,7 @@ def convert_to_onnx(source: str, output_dir: Optional[str] = None) -> bool:
         export_name = "export_qwen35_onnx_q4f16.py"
 
     export_script = None
-    if export_name:
+    if export_name and onnx_quant in ("q4f16", "int4"):
         for d in search_dirs:
             if (d / export_name).exists():
                 export_script = d / export_name
@@ -984,24 +1078,55 @@ def convert_to_onnx(source: str, output_dir: Optional[str] = None) -> bool:
 
     if export_script:
         cmd = [sys.executable, str(export_script), "--model-dir", str(src_path), "--output-dir", str(out_p)]
-        print(f"[*] Running architecture-specific WebGPU exporter: {export_script}")
+        print(f"[*] Running architecture-specific WebGPU ({onnx_quant}) exporter: {export_script}")
         try:
             subprocess.run(cmd, check=True)
-            print(f"[+] Successfully exported WebGPU ONNX model to '{out_p}'!")
+            print(f"[+] Successfully exported WebGPU ONNX ({onnx_quant}) model to '{out_p}'!")
             return True
         except subprocess.CalledProcessError as e:
             print(f"[-] ONNX export failed: {e}", file=sys.stderr)
             return False
     elif shutil.which("optimum-cli"):
         cmd = ["optimum-cli", "export", "onnx", "--model", str(src_path), "--task", "text-generation-with-past", str(out_p)]
-        print(f"[*] Running optimum-cli universal ONNX exporter...")
+        if onnx_quant == "fp16":
+            cmd.extend(["--dtype", "fp16"])
+        print(f"[*] Step 1/2: Exporting ONNX graph via optimum-cli...")
         try:
             subprocess.run(cmd, check=True)
-            print(f"[+] Successfully exported ONNX model to '{out_p}'!")
-            return True
         except subprocess.CalledProcessError as e:
             print(f"[-] optimum-cli export failed: {e}", file=sys.stderr)
             return False
+
+        # Step 2: Quantize ONNX weights if 4-bit or 8-bit requested
+        if onnx_quant in ("q4f16", "int4", "int8"):
+            print(f"[*] Step 2/2: Quantizing ONNX weights ({onnx_quant})...")
+            onnx_files = list(out_p.glob("*.onnx"))
+            if onnx_files:
+                q_code = r'''
+import sys
+from pathlib import Path
+onnx_file = Path(sys.argv[1])
+q_mode = sys.argv[2]
+if q_mode in ("q4f16", "int4"):
+    from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
+    import onnx
+    model = onnx.load(str(onnx_file), load_external_data=True)
+    quant = MatMulNBitsQuantizer(model=model, block_size=32, is_symmetric=True, bits=4)
+    quant.process()
+    out_file = onnx_file.with_name(onnx_file.stem + f"_{q_mode}.onnx")
+    quant.model.save_model_to_file(str(out_file), use_external_data_format=True)
+    print(f"Quantized 4-bit ONNX saved to {out_file}")
+elif q_mode == "int8":
+    from onnxruntime.quantization import quantize_dynamic, QuantType
+    out_file = onnx_file.with_name(onnx_file.stem + "_int8.onnx")
+    quantize_dynamic(str(onnx_file), str(out_file), weight_type=QuantType.QInt8)
+    print(f"Quantized INT8 ONNX saved to {out_file}")
+'''
+                res = subprocess.run([sys.executable, "-c", q_code, str(onnx_files[0]), onnx_quant])
+                if res.returncode != 0:
+                    print("[-] Warning: ONNX quantization step failed (is onnxruntime installed?). Unquantized ONNX is available in output dir.", file=sys.stderr)
+        print(f"[+] Successfully exported ONNX ({onnx_quant}) model to '{out_p}'!")
+        return True
     else:
         print(f"[-] No ONNX exporter found for architecture '{model_type}' (install optimum or provide an exporter script).", file=sys.stderr)
         return False
@@ -1060,6 +1185,7 @@ Examples:
     convert_parser.add_argument("--name", help="Model name for Ollama")
     convert_parser.add_argument("--bits", type=int, default=4, choices=[4, 8, 16], help="Quantization bits for MLX (default: 4)")
     convert_parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"], help="Target dtype for Safetensors export")
+    convert_parser.add_argument("--onnx-quant", default="q4f16", choices=["q4f16", "int4", "int8", "fp16"], help="Target quantization/precision for ONNX export")
     convert_parser.add_argument("--quant", default="Q4_K_M", help="Target quantization for GGUF (e.g. Q4_K_M, Q8_0)")
     convert_parser.add_argument("--output", help="Output path/directory")
     convert_parser.add_argument("--system", help="System prompt to embed (for Ollama)")
@@ -1161,7 +1287,7 @@ Examples:
         elif args.to == "safetensors":
             ok = convert_to_safetensors(args.source, output_dir=args.output, dtype=args.dtype)
         elif args.to == "onnx":
-            ok = convert_to_onnx(args.source, output_dir=args.output)
+            ok = convert_to_onnx(args.source, output_dir=args.output, onnx_quant=args.onnx_quant)
         elif args.to == "lmstudio":
             print("[-] Local file -> LM Studio: place your GGUF/HF folder in ~/.lmstudio/models/ or use archive/export.", file=sys.stderr)
         sys.exit(0 if ok else 1)

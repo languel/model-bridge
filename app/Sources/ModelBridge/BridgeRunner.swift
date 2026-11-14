@@ -33,6 +33,7 @@ final class BridgeState {
     var mlxBits: Int = 4
     var ggufQuant: String = "Q4_K_M"
     var safetensorsDtype: String = "bfloat16"
+    var onnxQuant: String = "q4f16"
     var customOutputPath: String = ""
 
     var status: ConversionStatus = .idle
@@ -203,6 +204,7 @@ final class BridgeState {
                     args.append(contentsOf: ["--output", customOutputPath.trimmingCharacters(in: .whitespaces)])
                 }
             case .onnx:
+                args.append(contentsOf: ["--onnx-quant", onnxQuant])
                 if !customOutputPath.trimmingCharacters(in: .whitespaces).isEmpty {
                     args.append(contentsOf: ["--output", customOutputPath.trimmingCharacters(in: .whitespaces)])
                 }

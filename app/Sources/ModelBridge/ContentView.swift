@@ -192,7 +192,7 @@ struct ContentView: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
-                    TextField("Drop a .gguf file or Hugging Face folder, or browse…", text: $state.sourcePath)
+                    TextField("Drop .gguf / folder, browse, or enter HuggingFace ID (e.g. LiquidAI/LFM2.5-1.2B-Instruct)", text: $state.sourcePath)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit {
                             state.selectSource(state.sourcePath)
@@ -404,11 +404,24 @@ struct ContentView: View {
                 case .onnx:
                     Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
                         GridRow {
+                            Text("Quantization")
+                                .frame(width: 100, alignment: .trailing)
+                                .foregroundStyle(.secondary)
+                            Picker("ONNX Quant", selection: $state.onnxQuant) {
+                                Text("4-bit (q4f16)").tag("q4f16")
+                                Text("INT4").tag("int4")
+                                Text("INT8").tag("int8")
+                                Text("FP16").tag("fp16")
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                        }
+                        GridRow {
                             Text("Output Dir")
                                 .frame(width: 100, alignment: .trailing)
                                 .foregroundStyle(.secondary)
                             HStack(spacing: 8) {
-                                TextField("Default: <source>-ONNX-q4f16", text: $state.customOutputPath)
+                                TextField("Default: ~/ModelExports/<name>-ONNX-<quant>", text: $state.customOutputPath)
                                     .textFieldStyle(.roundedBorder)
                                 Button("Choose…") {
                                     pickOutputFolder()
@@ -617,9 +630,9 @@ struct ContentView: View {
 
     private func formatColor(_ fmt: String?) -> Color {
         switch fmt {
-        case "GGUF": return .blue
-        case "MLX": return .purple
-        case "HuggingFace Safetensors": return .orange
+        case "GGUF", "Ollama (GGUF)": return .blue
+        case "MLX", "Ollama (MLX/Safetensors)", "Ollama (Custom/MLX)": return .purple
+        case "HuggingFace Safetensors", "HuggingFace Hub": return .orange
         default: return .gray
         }
     }
