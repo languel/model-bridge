@@ -26,6 +26,10 @@ final class BridgeState {
     var ollamaParser: String = ""
     var ollamaCapabilities: String = "completion"
     var moveToOllama: Bool = false
+    var moveToArchive: Bool = false
+    var archiveDir: String = UserDefaults.standard.string(forKey: "archiveDir") ?? (NSHomeDirectory() + "/ModelArchive") {
+        didSet { UserDefaults.standard.set(archiveDir, forKey: "archiveDir") }
+    }
     var mlxBits: Int = 4
     var ggufQuant: String = "Q4_K_M"
     var customOutputPath: String = ""
@@ -63,6 +67,15 @@ final class BridgeState {
 
     var compatibilityWarning: String? {
         guard let fmt = inspectedModel?.format else { return nil }
+        if sourcePath.hasPrefix("ollama:") {
+            if targetFormat == .ollama || targetFormat == .mlx || targetFormat == .onnx {
+                return "To export an Ollama model, select GGUF, LM Studio, or Archive."
+            }
+            if targetFormat == .lmstudio && inspectedModel?.has_single_gguf == false {
+                return "This Ollama model uses split MLX/Safetensors layers. Exporting will create a portable bundle rather than a single GGUF."
+            }
+            return nil
+        }
         if fmt == "GGUF" && (targetFormat == .mlx || targetFormat == .onnx) {
             return "Quantized GGUF → \(targetFormat.displayName) is lossy/unsupported. Select a Hugging Face Safetensors directory instead."
         }
@@ -86,11 +99,20 @@ final class BridgeState {
 
     func selectSource(_ path: String) {
         self.sourcePath = path
-        let base = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
-            .lowercased()
-            .replacingOccurrences(of: "_", with: "-")
-            .replacingOccurrences(of: " ", with: "-")
-        self.ollamaModelName = base
+        if path.hasPrefix("ollama:") {
+            if targetFormat == .ollama || targetFormat == .mlx || targetFormat == .onnx {
+                targetFormat = .archive
+            }
+        } else {
+            let base = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+                .lowercased()
+                .replacingOccurrences(of: "_", with: "-")
+                .replacingOccurrences(of: " ", with: "-")
+            self.ollamaModelName = base
+            if targetFormat == .lmstudio {
+                targetFormat = .ollama
+            }
+        }
         Task {
             await inspectSource(path)
         }
@@ -130,42 +152,60 @@ final class BridgeState {
     func startConversion() {
         guard status != .running, !sourcePath.isEmpty else { return }
 
-        var args = [cliScriptPath, "convert", sourcePath, "--to", targetFormat.rawValue]
+        var args: [String] = [cliScriptPath]
 
-        switch targetFormat {
-        case .ollama:
-            if !ollamaModelName.trimmingCharacters(in: .whitespaces).isEmpty {
-                args.append(contentsOf: ["--name", ollamaModelName.trimmingCharacters(in: .whitespaces)])
-            }
-            if !ollamaSystemPrompt.trimmingCharacters(in: .whitespaces).isEmpty {
-                args.append(contentsOf: ["--system", ollamaSystemPrompt])
-            }
-            args.append(contentsOf: ["--ctx", String(ollamaNumCtx)])
-            if !ollamaRenderer.trimmingCharacters(in: .whitespaces).isEmpty {
-                args.append(contentsOf: ["--renderer", ollamaRenderer.trimmingCharacters(in: .whitespaces)])
-            }
-            if !ollamaParser.trimmingCharacters(in: .whitespaces).isEmpty {
-                args.append(contentsOf: ["--parser", ollamaParser.trimmingCharacters(in: .whitespaces)])
-            }
-            if !ollamaCapabilities.trimmingCharacters(in: .whitespaces).isEmpty {
-                args.append(contentsOf: ["--capabilities", ollamaCapabilities.trimmingCharacters(in: .whitespaces)])
-            }
-            if moveToOllama {
+        if targetFormat == .archive {
+            args.append(contentsOf: ["archive", sourcePath, "--dest", archiveDir])
+            if moveToArchive {
                 args.append("--move")
             }
-        case .mlx:
-            args.append(contentsOf: ["--bits", String(mlxBits)])
-            if !customOutputPath.trimmingCharacters(in: .whitespaces).isEmpty {
-                args.append(contentsOf: ["--output", customOutputPath.trimmingCharacters(in: .whitespaces)])
-            }
-        case .gguf:
-            args.append(contentsOf: ["--quant", ggufQuant])
-            if !customOutputPath.trimmingCharacters(in: .whitespaces).isEmpty {
-                args.append(contentsOf: ["--output", customOutputPath.trimmingCharacters(in: .whitespaces)])
-            }
-        case .onnx:
-            if !customOutputPath.trimmingCharacters(in: .whitespaces).isEmpty {
-                args.append(contentsOf: ["--output", customOutputPath.trimmingCharacters(in: .whitespaces)])
+        } else {
+            args.append(contentsOf: ["convert", sourcePath, "--to", targetFormat.rawValue])
+
+            switch targetFormat {
+            case .ollama:
+                if !ollamaModelName.trimmingCharacters(in: .whitespaces).isEmpty {
+                    args.append(contentsOf: ["--name", ollamaModelName.trimmingCharacters(in: .whitespaces)])
+                }
+                if !ollamaSystemPrompt.trimmingCharacters(in: .whitespaces).isEmpty {
+                    args.append(contentsOf: ["--system", ollamaSystemPrompt])
+                }
+                args.append(contentsOf: ["--ctx", String(ollamaNumCtx)])
+                if !ollamaRenderer.trimmingCharacters(in: .whitespaces).isEmpty {
+                    args.append(contentsOf: ["--renderer", ollamaRenderer.trimmingCharacters(in: .whitespaces)])
+                }
+                if !ollamaParser.trimmingCharacters(in: .whitespaces).isEmpty {
+                    args.append(contentsOf: ["--parser", ollamaParser.trimmingCharacters(in: .whitespaces)])
+                }
+                if !ollamaCapabilities.trimmingCharacters(in: .whitespaces).isEmpty {
+                    args.append(contentsOf: ["--capabilities", ollamaCapabilities.trimmingCharacters(in: .whitespaces)])
+                }
+                if moveToOllama {
+                    args.append("--move")
+                }
+            case .mlx:
+                args.append(contentsOf: ["--bits", String(mlxBits)])
+                if !customOutputPath.trimmingCharacters(in: .whitespaces).isEmpty {
+                    args.append(contentsOf: ["--output", customOutputPath.trimmingCharacters(in: .whitespaces)])
+                }
+            case .gguf:
+                args.append(contentsOf: ["--quant", ggufQuant])
+                if !customOutputPath.trimmingCharacters(in: .whitespaces).isEmpty {
+                    args.append(contentsOf: ["--output", customOutputPath.trimmingCharacters(in: .whitespaces)])
+                }
+                if sourcePath.hasPrefix("ollama:") && moveToArchive {
+                    args.append("--move")
+                }
+            case .onnx:
+                if !customOutputPath.trimmingCharacters(in: .whitespaces).isEmpty {
+                    args.append(contentsOf: ["--output", customOutputPath.trimmingCharacters(in: .whitespaces)])
+                }
+            case .lmstudio:
+                if moveToArchive {
+                    args.append("--move")
+                }
+            case .archive:
+                break
             }
         }
 
@@ -222,6 +262,49 @@ final class BridgeState {
         activeProcess = nil
         status = .failed
         logOutput.append("\n[Cancelled by user]\n")
+    }
+
+    func deleteOllamaModel(_ name: String) async {
+        logOutput.append("\n[*] Deleting Ollama model '\(name)'...\n")
+        let ok = await runSimple(args: ["delete-ollama", name])
+        logOutput.append(ok ? "[+] Deleted '\(name)' from Ollama.\n" : "[-] Failed to delete '\(name)'.\n")
+        if sourcePath == "ollama:\(name)" {
+            sourcePath = ""
+            inspectedModel = nil
+        }
+        await refreshAll()
+    }
+
+    func deleteLMStudioModel(_ path: String) async {
+        logOutput.append("\n[*] Deleting LM Studio model '\(path)'...\n")
+        let ok = await runSimple(args: ["delete-lmstudio", path])
+        logOutput.append(ok ? "[+] Deleted from LM Studio.\n" : "[-] Failed to delete from LM Studio.\n")
+        if sourcePath == path {
+            sourcePath = ""
+            inspectedModel = nil
+        }
+        await refreshAll()
+    }
+
+    private func runSimple(args: [String]) async -> Bool {
+        let py = pythonPath
+        let script = cliScriptPath
+        return await Task.detached(priority: .userInitiated) {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: py)
+            proc.arguments = [script] + args
+            var env = ProcessInfo.processInfo.environment
+            let existingPath = env["PATH"] ?? "/usr/bin:/bin"
+            env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:\(existingPath)"
+            proc.environment = env
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+                return proc.terminationStatus == 0
+            } catch {
+                return false
+            }
+        }.value
     }
 
     // MARK: - Subprocess JSON Helpers

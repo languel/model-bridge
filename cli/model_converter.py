@@ -149,7 +149,10 @@ def inspect_hf_or_mlx(dir_path: Path) -> Dict[str, Any]:
 
 
 def inspect_model(target: str) -> Dict[str, Any]:
-    """Inspect any model path, file, or LM Studio identifier."""
+    """Inspect any model path, file, Ollama model ('ollama:<name>'), or LM Studio identifier."""
+    if target.startswith("ollama:"):
+        return inspect_ollama_model(target.replace("ollama:", "", 1))
+
     p = Path(target).expanduser()
     if p.is_file() and p.suffix.lower() == ".gguf":
         return inspect_gguf(p)
@@ -223,6 +226,230 @@ def list_ollama_models() -> List[Dict[str, Any]]:
                 "modified": " ".join(parts[4:]) if len(parts) > 4 else "unknown",
             })
     return models
+
+
+OLLAMA_MODELS_DIR = Path(os.environ.get("OLLAMA_MODELS", Path.home() / ".ollama" / "models"))
+
+
+def find_ollama_manifest(model_name: str) -> Optional[Path]:
+    """Resolves an Ollama model name (e.g. 'lfm3:1.7b' or 'LisyNeko/qwen3.8-9b-coder:latest') to its manifest file."""
+    clean = model_name.strip()
+    if ":" in clean:
+        repo_part, tag = clean.rsplit(":", 1)
+    else:
+        repo_part, tag = clean, "latest"
+
+    if "/" in repo_part:
+        rel = Path("registry.ollama.ai") / repo_part / tag
+    else:
+        rel = Path("registry.ollama.ai") / "library" / repo_part / tag
+
+    manifest_path = OLLAMA_MODELS_DIR / "manifests" / rel
+    if manifest_path.is_file():
+        return manifest_path
+
+    # Fallback: search manifests directory for matching repo/tag
+    manifests_root = OLLAMA_MODELS_DIR / "manifests"
+    if manifests_root.exists():
+        for p in manifests_root.rglob(tag):
+            if p.is_file() and p.parent.name == repo_part.split("/")[-1]:
+                return p
+    return None
+
+
+def inspect_ollama_model(model_name: str) -> Dict[str, Any]:
+    """Inspects an Ollama model's manifest and underlying weight format (GGUF vs MLX/Safetensors)."""
+    manifest_path = find_ollama_manifest(model_name)
+    if not manifest_path:
+        return {"error": f"Manifest not found for Ollama model '{model_name}'."}
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"error": f"Failed to parse manifest: {e}"}
+
+    layers = manifest.get("layers", [])
+    runner = manifest.get("runner", "")
+    fmt = manifest.get("format", "")
+    model_blobs = [l for l in layers if l.get("mediaType") == "application/vnd.ollama.image.model"]
+    tensor_blobs = [l for l in layers if l.get("mediaType") == "application/vnd.ollama.image.tensor"]
+
+    total_bytes = sum(l.get("size", 0) for l in layers)
+    backend = "GGUF" if model_blobs else ("MLX/Safetensors" if (runner == "mlx" or fmt == "safetensors" or tensor_blobs) else "Unknown")
+
+    return {
+        "name": model_name,
+        "format": f"Ollama ({backend})",
+        "backend": backend,
+        "manifest_path": str(manifest_path),
+        "file_size_gb": round(total_bytes / (1024**3), 2),
+        "num_layers": len(layers),
+        "has_single_gguf": len(model_blobs) == 1,
+    }
+
+
+def export_ollama_model(
+    model_name: str,
+    output_path: Optional[str] = None,
+    to_lmstudio: bool = False,
+    move: bool = False,
+) -> bool:
+    """Exports an Ollama model to GGUF (or self-contained bundle) and optionally imports to LM Studio."""
+    manifest_path = find_ollama_manifest(model_name)
+    if not manifest_path:
+        print(f"[-] Could not find Ollama manifest for '{model_name}'.", file=sys.stderr)
+        return False
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    layers = manifest.get("layers", [])
+    blobs_dir = OLLAMA_MODELS_DIR / "blobs"
+    safe_name = model_name.replace(":", "-").replace("/", "_")
+
+    model_layers = [l for l in layers if l.get("mediaType") == "application/vnd.ollama.image.model"]
+
+    if to_lmstudio:
+        dest_dir = LM_STUDIO_MODELS_DIR / "ollama-export" / safe_name
+    elif output_path:
+        p = Path(output_path).expanduser()
+        dest_dir = p.parent if p.suffix.lower() == ".gguf" else p
+    else:
+        dest_dir = Path.home() / "ModelExports" / safe_name
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save Modelfile
+    modelfile_res = subprocess.run(["ollama", "show", model_name, "--modelfile"], capture_output=True, text=True)
+    if modelfile_res.returncode == 0:
+        (dest_dir / "Modelfile").write_text(modelfile_res.stdout, encoding="utf-8")
+
+    if len(model_layers) == 1:
+        digest = model_layers[0]["digest"].replace(":", "-")
+        blob_file = blobs_dir / digest
+        if not blob_file.exists():
+            print(f"[-] Blob missing: {blob_file}", file=sys.stderr)
+            return False
+
+        if output_path and Path(output_path).suffix.lower() == ".gguf" and not to_lmstudio:
+            gguf_dest = Path(output_path).expanduser()
+        else:
+            gguf_dest = dest_dir / f"{safe_name}.gguf"
+
+        print(f"[*] Extracting GGUF blob ({round(blob_file.stat().st_size / (1024**3), 2)} GB) -> {gguf_dest}")
+        shutil.copy2(blob_file, gguf_dest)
+        # Update Modelfile FROM to point to local GGUF for portability
+        if (dest_dir / "Modelfile").exists():
+            mf_lines = (dest_dir / "Modelfile").read_text(encoding="utf-8").splitlines()
+            new_mf = [f"FROM ./{gguf_dest.name}" if l.startswith("FROM ") else l for l in mf_lines]
+            (dest_dir / "Modelfile").write_text("\n".join(new_mf) + "\n", encoding="utf-8")
+        print(f"[+] Exported GGUF to: {gguf_dest}")
+    else:
+        if to_lmstudio:
+            print("[-] Note: This Ollama model uses split safetensors/MLX layers; exporting self-contained bundle instead of single GGUF.")
+        print(f"[*] Exporting Ollama bundle ({len(layers)} layers) -> {dest_dir}")
+        (dest_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        out_blobs = dest_dir / "blobs"
+        out_blobs.mkdir(exist_ok=True)
+        for l in layers:
+            digest = l.get("digest", "").replace(":", "-")
+            if not digest:
+                continue
+            src_blob = blobs_dir / digest
+            if src_blob.exists():
+                shutil.copy2(src_blob, out_blobs / digest)
+                # Also extract readable JSON files (config.json, tokenizer.json, etc.)
+                if l.get("mediaType") == "application/vnd.ollama.image.json" and l.get("name"):
+                    shutil.copy2(src_blob, dest_dir / l["name"])
+        print(f"[+] Exported Ollama bundle to: {dest_dir}")
+
+    if move:
+        print(f"[*] --move enabled: removing '{model_name}' from Ollama registry...")
+        subprocess.run(["ollama", "rm", model_name], check=True)
+        print(f"[+] Removed '{model_name}' from Ollama.")
+
+    return True
+
+
+def archive_model(source: str, archive_dir: str, move: bool = False) -> bool:
+    """Archives an Ollama model or LM Studio / local model directory to a backup/external drive folder."""
+    dest_root = Path(archive_dir).expanduser().resolve()
+    dest_root.mkdir(parents=True, exist_ok=True)
+
+    # Check if source is prefixed with 'ollama:' or matches an Ollama manifest
+    if source.startswith("ollama:") or (not Path(source).expanduser().exists() and find_ollama_manifest(source) is not None):
+        ol_name = source.replace("ollama:", "", 1)
+        safe_name = ol_name.replace(":", "-").replace("/", "_")
+        target_dir = dest_root / "ollama" / safe_name
+        print(f"[*] Archiving Ollama model '{ol_name}' -> {target_dir}")
+        return export_ollama_model(ol_name, output_path=str(target_dir), to_lmstudio=False, move=move)
+
+    # Otherwise treat as local path / LM Studio model
+    info = inspect_model(source)
+    if "error" in info:
+        print(f"[-] Error inspecting source: {info['error']}", file=sys.stderr)
+        return False
+
+    src_path = Path(info["path"]).resolve()
+    try:
+        rel = src_path.relative_to(LM_STUDIO_MODELS_DIR.resolve())
+        target_path = dest_root / "lmstudio" / rel
+    except ValueError:
+        target_path = dest_root / "local" / src_path.name
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[*] {'Moving' if move else 'Copying'} ({info.get('file_size_gb', 0)} GB) -> {target_path}")
+
+    if src_path.is_dir():
+        if target_path.exists():
+            shutil.rmtree(target_path)
+        shutil.copytree(src_path, target_path)
+        if move:
+            shutil.rmtree(src_path)
+    else:
+        shutil.copy2(src_path, target_path)
+        if move:
+            src_path.unlink()
+
+    print(f"[+] Archived successfully to: {target_path}")
+    return True
+
+
+def delete_ollama_model(model_name: str) -> bool:
+    """Deletes a model from the Ollama registry."""
+    print(f"[*] Removing Ollama model: {model_name}")
+    res = subprocess.run(["ollama", "rm", model_name])
+    if res.returncode == 0:
+        print(f"[+] Deleted '{model_name}' from Ollama.")
+        return True
+    print(f"[-] Failed to delete '{model_name}' from Ollama.", file=sys.stderr)
+    return False
+
+
+def delete_lmstudio_model(path_str: str) -> bool:
+    """Safely deletes a model inside ~/.lmstudio/models/."""
+    target = Path(path_str).expanduser().resolve()
+    lm_root = LM_STUDIO_MODELS_DIR.resolve()
+    try:
+        target.relative_to(lm_root)
+    except ValueError:
+        print(f"[-] Safety check: '{target}' is not inside '{lm_root}'. Refusing to delete.", file=sys.stderr)
+        return False
+
+    if not target.exists():
+        print(f"[-] Path not found: {target}", file=sys.stderr)
+        return False
+
+    print(f"[*] Deleting LM Studio model: {target}")
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+
+    # Clean up empty parent author folder if applicable
+    if target.parent != lm_root and target.parent.is_dir() and not any(target.parent.iterdir()):
+        target.parent.rmdir()
+
+    print(f"[+] Deleted '{target.name}' from LM Studio.")
+    return True
 
 
 # =====================================================================
@@ -562,8 +789,8 @@ Examples:
 
     # Convert
     convert_parser = subparsers.add_parser("convert", help="Convert model between formats")
-    convert_parser.add_argument("source", help="Source model file, HF directory, or LM Studio identifier")
-    convert_parser.add_argument("--to", required=True, choices=["ollama", "mlx", "onnx", "gguf"], help="Target format")
+    convert_parser.add_argument("source", help="Source model file, HF directory, LM Studio ID, or 'ollama:<name>'")
+    convert_parser.add_argument("--to", required=True, choices=["ollama", "mlx", "onnx", "gguf", "lmstudio"], help="Target format")
     convert_parser.add_argument("--name", help="Model name for Ollama")
     convert_parser.add_argument("--bits", type=int, default=4, choices=[4, 8, 16], help="Quantization bits for MLX (default: 4)")
     convert_parser.add_argument("--quant", default="Q4_K_M", help="Target quantization for GGUF (e.g. Q4_K_M, Q8_0)")
@@ -574,7 +801,28 @@ Examples:
     convert_parser.add_argument("--renderer", help="Ollama RENDERER (e.g. qwen3.5, qwen3.8, gemma4)")
     convert_parser.add_argument("--parser", dest="parser_name", help="Ollama PARSER (e.g. qwen3.5)")
     convert_parser.add_argument("--capabilities", help="Comma-separated Ollama CAPABILITY values (e.g. completion,tools,thinking)")
-    convert_parser.add_argument("--move", action="store_true", help="Remove original source after successful Ollama import to save disk space")
+    convert_parser.add_argument("--move", action="store_true", help="Remove original source after successful import/export to save disk space")
+
+    # Export from Ollama
+    export_ol_parser = subparsers.add_parser("export-ollama", help="Export an Ollama model to GGUF or portable bundle")
+    export_ol_parser.add_argument("name", help="Ollama model name (e.g. lfm3:1.7b)")
+    export_ol_parser.add_argument("--output", help="Output directory or .gguf path")
+    export_ol_parser.add_argument("--to-lmstudio", action="store_true", help="Export directly into ~/.lmstudio/models/ollama-export/")
+    export_ol_parser.add_argument("--move", action="store_true", help="Remove from Ollama after export")
+
+    # Archive
+    archive_parser = subparsers.add_parser("archive", help="Copy or move a model (Ollama or LM Studio) to an archive/external drive folder")
+    archive_parser.add_argument("source", help="Local path or 'ollama:<name>'")
+    archive_parser.add_argument("--dest", required=True, help="Archive destination folder (e.g. /Volumes/External/ModelArchive)")
+    archive_parser.add_argument("--move", action="store_true", help="Delete original after archiving")
+
+    # Delete Ollama
+    del_ol_parser = subparsers.add_parser("delete-ollama", help="Delete a model from Ollama registry")
+    del_ol_parser.add_argument("name", help="Ollama model name")
+
+    # Delete LM Studio
+    del_lm_parser = subparsers.add_parser("delete-lmstudio", help="Delete a model inside ~/.lmstudio/models")
+    del_lm_parser.add_argument("path", help="Path to LM Studio model file or folder")
 
     args = parser.parse_args()
 
@@ -616,7 +864,15 @@ Examples:
 
     elif args.command == "convert":
         ok = False
-        if args.to == "ollama":
+        if args.source.startswith("ollama:"):
+            ol_name = args.source.replace("ollama:", "", 1)
+            if args.to == "lmstudio":
+                ok = export_ollama_model(ol_name, to_lmstudio=True, move=args.move)
+            elif args.to == "gguf":
+                ok = export_ollama_model(ol_name, output_path=args.output, to_lmstudio=False, move=args.move)
+            else:
+                print(f"[-] Direct Ollama -> {args.to} conversion is not supported. Export to GGUF or Archive first.", file=sys.stderr)
+        elif args.to == "ollama":
             caps = [c.strip() for c in args.capabilities.split(",")] if args.capabilities else None
             ok = convert_to_ollama(
                 args.source,
@@ -635,6 +891,24 @@ Examples:
             ok = quantize_gguf(args.source, target_quant=args.quant, output_file=args.output)
         elif args.to == "onnx":
             ok = convert_to_onnx(args.source, output_dir=args.output)
+        elif args.to == "lmstudio":
+            print("[-] Local file -> LM Studio: place your GGUF/HF folder in ~/.lmstudio/models/ or use archive/export.", file=sys.stderr)
+        sys.exit(0 if ok else 1)
+
+    elif args.command == "export-ollama":
+        ok = export_ollama_model(args.name, output_path=args.output, to_lmstudio=args.to_lmstudio, move=args.move)
+        sys.exit(0 if ok else 1)
+
+    elif args.command == "archive":
+        ok = archive_model(args.source, archive_dir=args.dest, move=args.move)
+        sys.exit(0 if ok else 1)
+
+    elif args.command == "delete-ollama":
+        ok = delete_ollama_model(args.name)
+        sys.exit(0 if ok else 1)
+
+    elif args.command == "delete-lmstudio":
+        ok = delete_lmstudio_model(args.path)
         sys.exit(0 if ok else 1)
     else:
         parser.print_help()

@@ -5,15 +5,17 @@ import AppKit
 struct ContentView: View {
     @State private var state = BridgeState()
     @State private var isDropTargeted = false
+    @State private var pendingDeleteOllama: String?
+    @State private var pendingDeleteLMStudio: LMStudioModel?
 
     var body: some View {
         NavigationSplitView {
             sidebarView
-                .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 340)
+                .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 350)
         } detail: {
             detailView
         }
-        .frame(minWidth: 860, minHeight: 620)
+        .frame(minWidth: 900, minHeight: 650)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -27,6 +29,44 @@ struct ContentView: View {
         }
         .task {
             await state.refreshAll()
+        }
+        .alert(
+            "Delete Ollama Model?",
+            isPresented: Binding(
+                get: { pendingDeleteOllama != nil },
+                set: { if !$0 { pendingDeleteOllama = nil } }
+            )
+        ) {
+            Button("Delete", role: .destructive) {
+                if let name = pendingDeleteOllama {
+                    Task { await state.deleteOllamaModel(name) }
+                }
+                pendingDeleteOllama = nil
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDeleteOllama = nil
+            }
+        } message: {
+            Text("This will permanently remove '\(pendingDeleteOllama ?? "")' from Ollama (`ollama rm`).")
+        }
+        .alert(
+            "Delete LM Studio Model?",
+            isPresented: Binding(
+                get: { pendingDeleteLMStudio != nil },
+                set: { if !$0 { pendingDeleteLMStudio = nil } }
+            )
+        ) {
+            Button("Delete", role: .destructive) {
+                if let m = pendingDeleteLMStudio {
+                    Task { await state.deleteLMStudioModel(m.path) }
+                }
+                pendingDeleteLMStudio = nil
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDeleteLMStudio = nil
+            }
+        } message: {
+            Text("This will permanently delete '\(pendingDeleteLMStudio?.displayName ?? "")' from disk.")
         }
     }
 
@@ -62,6 +102,19 @@ struct ContentView: View {
                         }
                         .buttonStyle(.plain)
                         .padding(.vertical, 2)
+                        .contextMenu {
+                            Button("Select as Source") {
+                                state.selectSource(model.path)
+                            }
+                            Button("Archive / Backup…") {
+                                state.selectSource(model.path)
+                                state.targetFormat = .archive
+                            }
+                            Divider()
+                            Button("Delete from Disk…", role: .destructive) {
+                                pendingDeleteLMStudio = model
+                            }
+                        }
                     }
                 }
             } header: {
@@ -75,19 +128,43 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(state.ollamaModels) { model in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(model.name)
-                                .font(.system(.callout, weight: .medium))
-                                .lineLimit(1)
-                            HStack {
-                                Text(model.size)
-                                Text("·")
-                                Text(model.modified)
+                        Button {
+                            state.selectSource("ollama:\(model.name)")
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(model.name)
+                                    .font(.system(.callout, weight: .medium))
+                                    .lineLimit(1)
+                                HStack {
+                                    Text(model.size)
+                                    Text("·")
+                                    Text(model.modified)
+                                }
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
                             }
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
                         .padding(.vertical, 2)
+                        .contextMenu {
+                            Button("Select as Source") {
+                                state.selectSource("ollama:\(model.name)")
+                            }
+                            Button("Export to LM Studio") {
+                                state.selectSource("ollama:\(model.name)")
+                                state.targetFormat = .lmstudio
+                            }
+                            Button("Archive / Backup…") {
+                                state.selectSource("ollama:\(model.name)")
+                                state.targetFormat = .archive
+                            }
+                            Divider()
+                            Button("Delete from Ollama…", role: .destructive) {
+                                pendingDeleteOllama = model.name
+                            }
+                        }
                     }
                 }
             } header: {
@@ -297,6 +374,44 @@ struct ContentView: View {
                                 .textFieldStyle(.roundedBorder)
                         }
                     }
+                case .lmstudio:
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+                        GridRow {
+                            Text("Destination")
+                                .frame(width: 100, alignment: .trailing)
+                                .foregroundStyle(.secondary)
+                            Text("~/.lmstudio/models/ollama-export/")
+                                .font(.system(.callout, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                        GridRow {
+                            Text("")
+                                .frame(width: 100)
+                            Toggle("Remove from Ollama after exporting to LM Studio", isOn: $state.moveToArchive)
+                                .font(.caption)
+                        }
+                    }
+                case .archive:
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+                        GridRow {
+                            Text("Archive Folder")
+                                .frame(width: 100, alignment: .trailing)
+                                .foregroundStyle(.secondary)
+                            HStack(spacing: 8) {
+                                TextField("/Volumes/ExternalDrive/ModelArchive", text: $state.archiveDir)
+                                    .textFieldStyle(.roundedBorder)
+                                Button("Choose…") {
+                                    pickArchiveFolder()
+                                }
+                            }
+                        }
+                        GridRow {
+                            Text("")
+                                .frame(width: 100)
+                            Toggle("Move to Archive (remove original from registry/disk after backup)", isOn: $state.moveToArchive)
+                                .font(.caption)
+                        }
+                    }
                 }
 
                 if let warning = state.compatibilityWarning {
@@ -317,7 +432,9 @@ struct ContentView: View {
                         Button(role: .destructive) {
                             state.stopConversion()
                         } label: {
-                            Label("Stop Conversion", systemImage: "stop.fill")
+                            Label("Stop", systemImage: "stop.fill")
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 6)
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(.red)
@@ -329,9 +446,17 @@ struct ContentView: View {
                         Button {
                             state.startConversion()
                         } label: {
-                            Label("Convert Model", systemImage: "arrow.triangle.2.circlepath")
+                            Label(
+                                state.targetFormat == .archive
+                                    ? (state.moveToArchive ? "Move to Archive" : "Copy to Archive")
+                                    : "Convert Model",
+                                systemImage: state.targetFormat == .archive ? "archivebox" : "arrow.triangle.2.circlepath"
+                            )
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6)
                         }
                         .buttonStyle(.borderedProminent)
+                        .tint(state.sourcePath.isEmpty ? .gray : .accentColor)
                         .disabled(state.sourcePath.isEmpty)
                     }
 
@@ -407,6 +532,18 @@ struct ContentView: View {
         panel.message = "Select a .gguf file or a Hugging Face / MLX model directory"
         if panel.runModal() == .OK, let url = panel.url {
             state.selectSource(url.path)
+        }
+    }
+
+    private func pickArchiveFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.message = "Select an Archive / Backup folder (e.g. on an external drive)"
+        if panel.runModal() == .OK, let url = panel.url {
+            state.archiveDir = url.path
         }
     }
 
