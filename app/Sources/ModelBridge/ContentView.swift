@@ -198,11 +198,48 @@ struct ContentView: View {
                                 .textFieldStyle(.roundedBorder)
                         }
                         GridRow {
+                            Text("Renderer / Parser")
+                                .frame(width: 100, alignment: .trailing)
+                                .foregroundStyle(.secondary)
+                            HStack(spacing: 8) {
+                                TextField("Renderer (e.g. qwen3.5, gemma4)", text: $state.ollamaRenderer)
+                                    .textFieldStyle(.roundedBorder)
+                                TextField("Parser (optional)", text: $state.ollamaParser)
+                                    .textFieldStyle(.roundedBorder)
+                            }
+                        }
+                        GridRow {
+                            Text("Capabilities")
+                                .frame(width: 100, alignment: .trailing)
+                                .foregroundStyle(.secondary)
+                            TextField("completion, tools, thinking", text: $state.ollamaCapabilities)
+                                .textFieldStyle(.roundedBorder)
+                        }
+                        GridRow {
+                            Text("Context (num_ctx)")
+                                .frame(width: 100, alignment: .trailing)
+                                .foregroundStyle(.secondary)
+                            Picker("Context", selection: $state.ollamaNumCtx) {
+                                Text("8K").tag(8192)
+                                Text("32K").tag(32768)
+                                Text("64K").tag(65536)
+                                Text("96K").tag(98304)
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                        }
+                        GridRow {
                             Text("System Prompt")
                                 .frame(width: 100, alignment: .trailing)
                                 .foregroundStyle(.secondary)
                             TextField("Optional system instruction", text: $state.ollamaSystemPrompt)
                                 .textFieldStyle(.roundedBorder)
+                        }
+                        GridRow {
+                            Text("")
+                                .frame(width: 100)
+                            Toggle("Move to Ollama (remove original files after import to save disk space)", isOn: $state.moveToOllama)
+                                .font(.caption)
                         }
                     }
                 case .mlx:

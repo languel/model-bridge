@@ -21,6 +21,11 @@ final class BridgeState {
     // Target-specific options
     var ollamaModelName: String = ""
     var ollamaSystemPrompt: String = ""
+    var ollamaNumCtx: Int = 32768
+    var ollamaRenderer: String = ""
+    var ollamaParser: String = ""
+    var ollamaCapabilities: String = "completion"
+    var moveToOllama: Bool = false
     var mlxBits: Int = 4
     var ggufQuant: String = "Q4_K_M"
     var customOutputPath: String = ""
@@ -61,7 +66,7 @@ final class BridgeState {
         if fmt == "GGUF" && (targetFormat == .mlx || targetFormat == .onnx) {
             return "Quantized GGUF → \(targetFormat.displayName) is lossy/unsupported. Select a Hugging Face Safetensors directory instead."
         }
-        if fmt == "MLX" && (targetFormat == .ollama || targetFormat == .gguf || targetFormat == .onnx) {
+        if fmt == "MLX" && (targetFormat == .gguf || targetFormat == .onnx) {
             return "MLX weights are already Apple Silicon quantized. Use an unquantized Hugging Face Safetensors folder for \(targetFormat.displayName) export."
         }
         return nil
@@ -81,13 +86,11 @@ final class BridgeState {
 
     func selectSource(_ path: String) {
         self.sourcePath = path
-        if ollamaModelName.isEmpty {
-            let base = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
-                .lowercased()
-                .replacingOccurrences(of: "_", with: "-")
-                .replacingOccurrences(of: " ", with: "-")
-            self.ollamaModelName = base
-        }
+        let base = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+            .replacingOccurrences(of: " ", with: "-")
+        self.ollamaModelName = base
         Task {
             await inspectSource(path)
         }
@@ -100,6 +103,28 @@ final class BridgeState {
         }
         let result: InspectedModel? = await fetchSingleJSON(args: ["inspect", path])
         self.inspectedModel = result
+
+        // Auto-populate Ollama card defaults from architecture
+        if let info = result {
+            let combined = "\(info.architecture ?? "") \(info.model_type ?? "") \(info.name ?? "")".lowercased()
+            if combined.contains("qwen3_5") || combined.contains("qwen3.5") {
+                ollamaRenderer = "qwen3.5"
+                ollamaParser = "qwen3.5"
+                ollamaCapabilities = "completion, tools, thinking"
+            } else if combined.contains("qwen3.8") || combined.contains("qwen3_8") {
+                ollamaRenderer = "qwen3.8"
+                ollamaParser = "qwen3.5"
+                ollamaCapabilities = "completion, tools, thinking"
+            } else if combined.contains("gemma4") {
+                ollamaRenderer = "gemma4"
+                ollamaParser = ""
+                ollamaCapabilities = "completion"
+            } else {
+                ollamaRenderer = ""
+                ollamaParser = ""
+                ollamaCapabilities = "completion"
+            }
+        }
     }
 
     func startConversion() {
@@ -114,6 +139,19 @@ final class BridgeState {
             }
             if !ollamaSystemPrompt.trimmingCharacters(in: .whitespaces).isEmpty {
                 args.append(contentsOf: ["--system", ollamaSystemPrompt])
+            }
+            args.append(contentsOf: ["--ctx", String(ollamaNumCtx)])
+            if !ollamaRenderer.trimmingCharacters(in: .whitespaces).isEmpty {
+                args.append(contentsOf: ["--renderer", ollamaRenderer.trimmingCharacters(in: .whitespaces)])
+            }
+            if !ollamaParser.trimmingCharacters(in: .whitespaces).isEmpty {
+                args.append(contentsOf: ["--parser", ollamaParser.trimmingCharacters(in: .whitespaces)])
+            }
+            if !ollamaCapabilities.trimmingCharacters(in: .whitespaces).isEmpty {
+                args.append(contentsOf: ["--capabilities", ollamaCapabilities.trimmingCharacters(in: .whitespaces)])
+            }
+            if moveToOllama {
+                args.append("--move")
             }
         case .mlx:
             args.append(contentsOf: ["--bits", String(mlxBits)])

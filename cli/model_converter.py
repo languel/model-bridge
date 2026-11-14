@@ -228,49 +228,166 @@ def list_ollama_models() -> List[Dict[str, Any]]:
 # =====================================================================
 # Converters & Bridges
 # =====================================================================
-def convert_to_ollama(source: str, model_name: Optional[str] = None, system_prompt: Optional[str] = None) -> bool:
-    """Imports GGUF or HF model into Ollama via auto-generated Modelfile."""
+def infer_ollama_card_defaults(info: Dict[str, Any]) -> Dict[str, Any]:
+    """Infers Ollama RENDERER, PARSER, and capabilities from inspected model metadata."""
+    arch = (info.get("architecture") or "").lower()
+    model_type = (info.get("model_type") or "").lower()
+    name = (info.get("name") or "").lower()
+    combined = f"{arch} {model_type} {name}"
+
+    defaults: Dict[str, Any] = {
+        "renderer": None,
+        "parser": None,
+        "capabilities": ["completion"],
+        "num_ctx": 32768,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 30,
+    }
+
+    if "qwen3_5" in combined or "qwen3.5" in combined:
+        defaults["renderer"] = "qwen3.5"
+        defaults["parser"] = "qwen3.5"
+        defaults["capabilities"] = ["completion", "tools", "thinking"]
+    elif "qwen3.8" in combined or "qwen3_8" in combined:
+        defaults["renderer"] = "qwen3.8"
+        defaults["parser"] = "qwen3.5"
+        defaults["capabilities"] = ["completion", "tools", "thinking"]
+    elif "gemma4" in combined:
+        defaults["renderer"] = "gemma4"
+        defaults["capabilities"] = ["completion"]
+    elif "lfm" in combined:
+        defaults["capabilities"] = ["completion"]
+
+    if "vision" in combined or "vl" in combined or "conditionalgeneration" in arch:
+        if "vision" not in defaults["capabilities"] and ("qwen3" in combined or "gemma4" in combined):
+            defaults["capabilities"].append("vision")
+
+    return defaults
+
+
+def build_modelfile(
+    src_path: Path,
+    info: Dict[str, Any],
+    system_prompt: Optional[str] = None,
+    num_ctx: Optional[int] = None,
+    temperature: Optional[float] = None,
+    renderer: Optional[str] = None,
+    parser_name: Optional[str] = None,
+    capabilities: Optional[List[str]] = None,
+) -> str:
+    """Builds a complete Ollama Model Card (Modelfile)."""
+    defaults = infer_ollama_card_defaults(info)
+    lines = [f"FROM {src_path.resolve()}"]
+
+    eff_renderer = renderer if renderer is not None else defaults["renderer"]
+    eff_parser = parser_name if parser_name is not None else defaults["parser"]
+    eff_caps = capabilities if capabilities is not None else defaults["capabilities"]
+    eff_ctx = num_ctx if num_ctx is not None else defaults["num_ctx"]
+    eff_temp = temperature if temperature is not None else defaults["temperature"]
+
+    if eff_renderer:
+        lines.append(f"RENDERER {eff_renderer}")
+    if eff_parser:
+        lines.append(f"PARSER {eff_parser}")
+
+    for cap in eff_caps:
+        cap_clean = cap.strip()
+        if cap_clean:
+            lines.append(f"CAPABILITY {cap_clean}")
+
+    lines.append(f"PARAMETER num_ctx {eff_ctx}")
+    lines.append(f"PARAMETER temperature {eff_temp}")
+    lines.append(f"PARAMETER top_p {defaults['top_p']}")
+    lines.append(f"PARAMETER top_k {defaults['top_k']}")
+    lines.append("PARAMETER repeat_penalty 1")
+
+    if system_prompt and system_prompt.strip():
+        lines.append(f'SYSTEM """{system_prompt.strip()}"""')
+
+    # Embed LICENSE if present in source directory
+    if src_path.is_dir():
+        for lic_name in ["LICENSE", "LICENSE.txt", "LICENSE.md"]:
+            lic_path = src_path / lic_name
+            if lic_path.is_file():
+                try:
+                    lic_text = lic_path.read_text(encoding="utf-8", errors="replace").strip()
+                    if lic_text:
+                        lines.append(f'LICENSE """\n{lic_text}\n"""')
+                except Exception:
+                    pass
+                break
+
+    return "\n".join(lines) + "\n"
+
+
+def convert_to_ollama(
+    source: str,
+    model_name: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    num_ctx: Optional[int] = None,
+    temperature: Optional[float] = None,
+    renderer: Optional[str] = None,
+    parser_name: Optional[str] = None,
+    capabilities: Optional[List[str]] = None,
+    move_source: bool = False,
+) -> bool:
+    """Imports GGUF, MLX, or HF Safetensors model into Ollama with a full Model Card."""
     info = inspect_model(source)
     if "error" in info:
         print(f"[-] Error inspecting source: {info['error']}", file=sys.stderr)
         return False
 
     src_path = Path(info["path"])
+    fmt = info.get("format", "unknown")
 
-    # If source is HF or MLX, we need GGUF first
-    if info.get("format") != "GGUF":
-        if src_path.is_dir():
-            ggufs = list(src_path.glob("*.gguf"))
-            if ggufs:
-                src_path = ggufs[0]
-            else:
-                print(f"[-] Source is {info.get('format')} format. Ollama requires GGUF weights.", file=sys.stderr)
-                print(f"    Tip: Convert HF -> GGUF first with: model_converter.py convert '{source}' --to gguf", file=sys.stderr)
-                return False
+    if fmt not in ("GGUF", "MLX", "HuggingFace Safetensors"):
+        print(f"[-] Unsupported source format '{fmt}' for Ollama import.", file=sys.stderr)
+        return False
 
     if not model_name:
         clean_name = src_path.stem.lower().replace("_", "-").replace(".", "-")
-        # Strip common quant suffixes for a clean ollama name
         clean_name = clean_name.replace("-q4-k-m", ":q4").replace("-q8-0", ":q8").replace("-bf16", ":bf16")
+        if fmt == "MLX" and "-mlx" not in clean_name:
+            clean_name += "-mlx"
         model_name = clean_name
 
-    print(f"[*] Preparing Ollama model '{model_name}' from GGUF: {src_path.name} ({info.get('file_size_gb', 0)} GB)")
+    print(f"[*] Preparing Ollama model '{model_name}' from {fmt}: {src_path.name} ({info.get('file_size_gb', 0)} GB)")
 
-    # Build Modelfile
-    modelfile_content = f"FROM {src_path.resolve()}\n"
-    modelfile_content += "PARAMETER temperature 0.6\n"
-    modelfile_content += "PARAMETER top_p 0.95\n"
-    if system_prompt:
-        modelfile_content += f'SYSTEM """{system_prompt}"""\n'
+    modelfile_content = build_modelfile(
+        src_path=src_path,
+        info=info,
+        system_prompt=system_prompt,
+        num_ctx=num_ctx,
+        temperature=temperature,
+        renderer=renderer,
+        parser_name=parser_name,
+        capabilities=capabilities,
+    )
 
-    modelfile_path = Path(f"/tmp/Modelfile_{model_name.replace(':', '_')}")
-    modelfile_path.write_text(modelfile_content)
+    print("[*] Generated Ollama Model Card (Modelfile):")
+    print("-" * 50)
+    for line in modelfile_content.splitlines()[:25]:
+        print(f"    {line}")
+    print("-" * 50)
+
+    modelfile_path = Path(f"/tmp/Modelfile_{model_name.replace(':', '_').replace('/', '_')}")
+    modelfile_path.write_text(modelfile_content, encoding="utf-8")
 
     try:
         print(f"[*] Executing: ollama create {model_name} -f {modelfile_path}")
         cmd = ["ollama", "create", model_name, "-f", str(modelfile_path)]
-        res = subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True)
         print(f"[+] Successfully registered '{model_name}' in Ollama!")
+
+        if move_source:
+            print(f"[*] --move enabled: removing original source at '{src_path}' (blobs are now stored in Ollama)...")
+            if src_path.is_dir():
+                shutil.rmtree(src_path)
+            elif src_path.is_file():
+                src_path.unlink()
+            print("[+] Original source moved/cleaned up.")
+
         print(f"    Run via: ollama run {model_name}")
         return True
     except subprocess.CalledProcessError as e:
@@ -452,6 +569,12 @@ Examples:
     convert_parser.add_argument("--quant", default="Q4_K_M", help="Target quantization for GGUF (e.g. Q4_K_M, Q8_0)")
     convert_parser.add_argument("--output", help="Output path/directory")
     convert_parser.add_argument("--system", help="System prompt to embed (for Ollama)")
+    convert_parser.add_argument("--ctx", type=int, help="Context length num_ctx (for Ollama)")
+    convert_parser.add_argument("--temp", type=float, help="Temperature parameter (for Ollama)")
+    convert_parser.add_argument("--renderer", help="Ollama RENDERER (e.g. qwen3.5, qwen3.8, gemma4)")
+    convert_parser.add_argument("--parser", dest="parser_name", help="Ollama PARSER (e.g. qwen3.5)")
+    convert_parser.add_argument("--capabilities", help="Comma-separated Ollama CAPABILITY values (e.g. completion,tools,thinking)")
+    convert_parser.add_argument("--move", action="store_true", help="Remove original source after successful Ollama import to save disk space")
 
     args = parser.parse_args()
 
@@ -494,7 +617,18 @@ Examples:
     elif args.command == "convert":
         ok = False
         if args.to == "ollama":
-            ok = convert_to_ollama(args.source, model_name=args.name, system_prompt=args.system)
+            caps = [c.strip() for c in args.capabilities.split(",")] if args.capabilities else None
+            ok = convert_to_ollama(
+                args.source,
+                model_name=args.name,
+                system_prompt=args.system,
+                num_ctx=args.ctx,
+                temperature=args.temp,
+                renderer=args.renderer,
+                parser_name=args.parser_name,
+                capabilities=caps,
+                move_source=args.move,
+            )
         elif args.to == "mlx":
             ok = convert_to_mlx(args.source, output_dir=args.output, q_bits=args.bits)
         elif args.to == "gguf":

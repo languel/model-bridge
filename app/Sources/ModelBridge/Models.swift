@@ -19,7 +19,7 @@ enum TargetFormat: String, CaseIterable, Identifiable {
 
     var subtitle: String {
         switch self {
-        case .ollama: return "Zero-copy GGUF registration into Ollama"
+        case .ollama: return "Import GGUF, MLX, or HF Safetensors into Ollama with a full Model Card"
         case .mlx: return "Apple Silicon Metal native weights (4/8/16-bit)"
         case .gguf: return "Quantize GGUF via llama-quantize"
         case .onnx: return "Browser WebGPU causal LM (q4f16)"
