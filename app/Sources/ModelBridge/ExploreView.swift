@@ -16,6 +16,7 @@ struct HFModelSummary: Codable, Identifiable, Hashable {
     let downloads: Int?
     let tags: [String]?
     let pipeline_tag: String?
+    let createdAt: String?
     let lastModified: String?
     let siblings: [HFSibling]?
 
@@ -152,6 +153,7 @@ struct ExploreView: View {
     var onSelectForBridge: (String) -> Void
 
     @State private var explorer = HFExplorerState()
+    @State private var readmeHeight: CGFloat = 420
 
     var body: some View {
         HSplitView {
@@ -214,7 +216,8 @@ struct ExploreView: View {
                 Picker("Sort", selection: $explorer.sortBy) {
                     Text("Downloads").tag("downloads")
                     Text("Likes").tag("likes")
-                    Text("Recent").tag("lastModified")
+                    Text("Updated").tag("lastModified")
+                    Text("Newest").tag("createdAt")
                 }
                 .labelsHidden()
                 .onChange(of: explorer.sortBy) {
@@ -257,6 +260,11 @@ struct ExploreView: View {
                             BadgeView(text: badge, color: badgeColor(badge))
                         }
                         Spacer()
+                        if let rel = relativeDate(model.lastModified ?? model.createdAt) {
+                            Text(rel)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
                         if let dl = model.downloads {
                             Label(formatCount(dl), systemImage: "arrow.down.circle")
                                 .font(.caption2)
@@ -270,6 +278,7 @@ struct ExploreView: View {
                     }
                 }
                 .padding(.vertical, 4)
+                .help(dateTooltip(created: model.createdAt, updated: model.lastModified))
                 .tag(model.id)
             }
             .listStyle(.inset)
@@ -316,6 +325,14 @@ struct ExploreView: View {
                         }
                         if let pipe = model.pipeline_tag {
                             InfoPill(label: "Task", value: pipe)
+                        }
+                        if let added = relativeDate(model.createdAt) {
+                            InfoPill(label: "Added", value: added)
+                                .help(formattedDate(model.createdAt) ?? "")
+                        }
+                        if let updated = relativeDate(model.lastModified) {
+                            InfoPill(label: "Updated", value: updated)
+                                .help(formattedDate(model.lastModified) ?? "")
                         }
                         ForEach(model.formatBadges, id: \.self) { badge in
                             BadgeView(text: badge, color: badgeColor(badge))
@@ -395,11 +412,12 @@ struct ExploreView: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(6)
                         } else {
-                            Text(explorer.readmeText.prefix(12000))
-                                .font(.system(.caption, design: .default))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(6)
+                            ReadmeWebView(
+                                markdown: explorer.readmeText,
+                                repoId: model.id,
+                                contentHeight: $readmeHeight
+                            )
+                            .frame(height: readmeHeight)
                         }
                     } label: {
                         Label("README", systemImage: "doc.text")
@@ -440,5 +458,37 @@ struct ExploreView: View {
         if gb >= 0.1 { return String(format: "%.2f GB", gb) }
         let mb = Double(bytes) / 1_048_576.0
         return String(format: "%.1f MB", mb)
+    }
+
+    private func parseISODate(_ iso: String?) -> Date? {
+        guard let iso, !iso.isEmpty else { return nil }
+        let withFrac = ISO8601DateFormatter()
+        withFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = withFrac.date(from: iso) { return d }
+        let basic = ISO8601DateFormatter()
+        basic.formatOptions = [.withInternetDateTime]
+        return basic.date(from: iso)
+    }
+
+    private func relativeDate(_ iso: String?) -> String? {
+        guard let date = parseISODate(iso) else { return nil }
+        let fmt = RelativeDateTimeFormatter()
+        fmt.unitsStyle = .abbreviated
+        return fmt.localizedString(for: date, relativeTo: Date())
+    }
+
+    private func formattedDate(_ iso: String?) -> String? {
+        guard let date = parseISODate(iso) else { return nil }
+        let fmt = DateFormatter()
+        fmt.dateStyle = .medium
+        fmt.timeStyle = .short
+        return fmt.string(from: date)
+    }
+
+    private func dateTooltip(created: String?, updated: String?) -> String {
+        var parts: [String] = []
+        if let c = formattedDate(created) { parts.append("Added: \(c)") }
+        if let u = formattedDate(updated) { parts.append("Updated: \(u)") }
+        return parts.joined(separator: "\n")
     }
 }
