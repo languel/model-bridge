@@ -1223,6 +1223,12 @@ Examples:
     del_lm_parser = subparsers.add_parser("delete-lmstudio", help="Delete a model inside ~/.lmstudio/models")
     del_lm_parser.add_argument("path", help="Path to LM Studio model file or folder")
 
+    # Download from Hugging Face
+    dl_parser = subparsers.add_parser("download", help="Download a Hugging Face repo to LM Studio or a custom folder")
+    dl_parser.add_argument("repo", help="Hugging Face repo ID (e.g. mlx-community/Qwen3.8-27B-4bit)")
+    dl_parser.add_argument("--to-lmstudio", action="store_true", help="Download into ~/.lmstudio/models/<owner>/<repo>")
+    dl_parser.add_argument("--output", help="Custom destination directory")
+
     args = parser.parse_args()
 
     if args.command == "inspect":
@@ -1313,6 +1319,29 @@ Examples:
     elif args.command == "delete-lmstudio":
         ok = delete_lmstudio_model(args.path)
         sys.exit(0 if ok else 1)
+
+    elif args.command == "download":
+        clean_id = args.repo.replace("hf:", "", 1).strip()
+        if args.to_lmstudio and "/" in clean_id:
+            owner, repo = clean_id.split("/", 1)
+            dest = LM_STUDIO_MODELS_DIR / owner / repo
+        elif args.output:
+            dest = Path(args.output).expanduser()
+        else:
+            dest = Path.home() / "ModelExports" / clean_id.replace("/", "_")
+        dest.mkdir(parents=True, exist_ok=True)
+        mlx_py = "/opt/homebrew/Cellar/mlx-lm/0.31.3_2/libexec/bin/python"
+        py_exec = mlx_py if Path(mlx_py).exists() else sys.executable
+        print(f"[*] Downloading '{clean_id}' -> {dest} ...")
+        code = (
+            "import sys; "
+            "from huggingface_hub import snapshot_download; "
+            "snapshot_download(repo_id=sys.argv[1], local_dir=sys.argv[2])"
+        )
+        res = subprocess.run([py_exec, "-c", code, clean_id, str(dest)])
+        if res.returncode == 0:
+            print(f"[+] Downloaded '{clean_id}' to '{dest}'!")
+        sys.exit(res.returncode)
     else:
         parser.print_help()
 

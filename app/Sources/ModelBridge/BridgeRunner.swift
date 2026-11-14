@@ -242,6 +242,19 @@ final class BridgeState {
             }
         }
 
+        runStreaming(args: args)
+    }
+
+    func downloadFromHF(repoId: String, toLMStudio: Bool = true) {
+        guard status != .running else { return }
+        var args = [cliScriptPath, "download", repoId]
+        if toLMStudio {
+            args.append("--to-lmstudio")
+        }
+        runStreaming(args: args)
+    }
+
+    private func runStreaming(args: [String]) {
         status = .running
         logOutput = "$ python3 \(args.dropFirst().joined(separator: " "))\n\n"
 

@@ -4,19 +4,37 @@ import AppKit
 
 struct ContentView: View {
     @State private var state = BridgeState()
+    @State private var activeTab: Int = 0
     @State private var isDropTargeted = false
     @State private var pendingDeleteOllama: String?
     @State private var pendingDeleteLMStudio: LMStudioModel?
 
     var body: some View {
-        NavigationSplitView {
-            sidebarView
-                .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 350)
-        } detail: {
-            detailView
+        Group {
+            if activeTab == 0 {
+                NavigationSplitView {
+                    sidebarView
+                        .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 350)
+                } detail: {
+                    detailView
+                }
+            } else {
+                ExploreView(bridgeState: state) { hfSource in
+                    state.selectSource(hfSource)
+                    activeTab = 0
+                }
+            }
         }
         .frame(minWidth: 900, minHeight: 650)
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                Picker("Mode", selection: $activeTab) {
+                    Text("Bridge & Convert").tag(0)
+                    Text("Explore Hub").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 240)
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     Task { await state.refreshAll() }
