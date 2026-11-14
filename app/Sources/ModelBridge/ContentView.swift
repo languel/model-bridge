@@ -202,10 +202,17 @@ struct ContentView: View {
                         pickSourcePath()
                     }
 
-                    Button("Inspect") {
-                        Task { await state.inspectSource(state.sourcePath) }
+                    Button {
+                        state.selectSource(state.sourcePath)
+                    } label: {
+                        if state.isInspecting {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Text("Inspect")
+                        }
                     }
-                    .disabled(state.sourcePath.isEmpty)
+                    .disabled(state.sourcePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || state.isInspecting)
                 }
 
                 if let info = state.inspectedModel {
@@ -227,6 +234,28 @@ struct ContentView: View {
                                 InfoPill(label: "Quant", value: "\(bits)-bit \(q.mode ?? "")")
                             } else if let shards = info.num_weight_shards, shards > 0 {
                                 InfoPill(label: "Shards", value: "\(shards)")
+                            }
+
+                            Spacer()
+
+                            if state.sourcePath.hasPrefix("ollama:") {
+                                Button(role: .destructive) {
+                                    pendingDeleteOllama = String(state.sourcePath.dropFirst("ollama:".count))
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                                .controlSize(.small)
+                                .buttonStyle(.bordered)
+                                .tint(.red)
+                            } else if let lmMatch = state.lmStudioModels.first(where: { $0.path == state.sourcePath }) {
+                                Button(role: .destructive) {
+                                    pendingDeleteLMStudio = lmMatch
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                                .controlSize(.small)
+                                .buttonStyle(.bordered)
+                                .tint(.red)
                             }
                         }
                     }

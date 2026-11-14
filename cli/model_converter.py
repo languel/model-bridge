@@ -208,6 +208,12 @@ def resolve_hf_hub_snapshot(repo_id: str) -> Optional[Path]:
 
 def inspect_model(target: str) -> Dict[str, Any]:
     """Inspect any model path, file, Ollama model ('ollama:<name>'), HF repo ('owner/repo'), or LM Studio ID."""
+    target = target.strip()
+    if target.startswith("https://huggingface.co/"):
+        parts = target.replace("https://huggingface.co/", "", 1).strip("/").split("/")
+        if len(parts) >= 2:
+            target = f"hf:{parts[0]}/{parts[1]}"
+
     if target.startswith("ollama:"):
         return inspect_ollama_model(target.replace("ollama:", "", 1))
 

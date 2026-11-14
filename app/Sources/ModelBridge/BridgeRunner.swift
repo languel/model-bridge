@@ -39,6 +39,7 @@ final class BridgeState {
     var status: ConversionStatus = .idle
     var logOutput: String = ""
     var isRefreshing: Bool = false
+    var isInspecting: Bool = false
 
     private var activeProcess: Process?
 
@@ -121,16 +122,32 @@ final class BridgeState {
     }
 
     func inspectSource(_ path: String) async {
-        guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
             self.inspectedModel = nil
             return
         }
-        let result: InspectedModel? = await fetchSingleJSON(args: ["inspect", path])
-        self.inspectedModel = result
+        isInspecting = true
+        defer { isInspecting = false }
 
-        // Auto-populate Ollama card defaults from architecture
-        if let info = result {
-            let combined = "\(info.architecture ?? "") \(info.model_type ?? "") \(info.name ?? "")".lowercased()
+        let (data, errStr) = await runCaptureWithErr(args: ["inspect", trimmed])
+        guard let data else {
+            let msg = errStr.isEmpty ? "Inspect command failed." : errStr
+            self.inspectedModel = InspectedModel(
+                format: nil, backend: nil, path: nil, name: nil,
+                architecture: nil, model_type: nil, file_size_gb: nil,
+                num_weight_shards: nil, n_tensors: nil, has_single_gguf: nil,
+                quantization: nil, error: msg
+            )
+            return
+        }
+
+        do {
+            let result = try JSONDecoder().decode(InspectedModel.self, from: data)
+            self.inspectedModel = result
+
+            // Auto-populate Ollama card defaults from architecture
+            let combined = "\(result.architecture ?? "") \(result.model_type ?? "") \(result.name ?? "")".lowercased()
             if combined.contains("qwen3_5") || combined.contains("qwen3.5") {
                 ollamaRenderer = "qwen3.5"
                 ollamaParser = "qwen3.5"
@@ -148,6 +165,14 @@ final class BridgeState {
                 ollamaParser = ""
                 ollamaCapabilities = "completion"
             }
+        } catch {
+            let raw = String(data: data, encoding: .utf8) ?? ""
+            self.inspectedModel = InspectedModel(
+                format: nil, backend: nil, path: nil, name: nil,
+                architecture: nil, model_type: nil, file_size_gb: nil,
+                num_weight_shards: nil, n_tensors: nil, has_single_gguf: nil,
+                quantization: nil, error: "Decode error: \(error.localizedDescription) (\(raw.prefix(120)))"
+            )
         }
     }
 
@@ -328,6 +353,11 @@ final class BridgeState {
     }
 
     private func runCapture(args: [String]) async -> Data? {
+        let (data, _) = await runCaptureWithErr(args: args)
+        return data
+    }
+
+    private func runCaptureWithErr(args: [String]) async -> (Data?, String) {
         let py = pythonPath
         let script = cliScriptPath
         return await Task.detached(priority: .userInitiated) {
@@ -341,16 +371,19 @@ final class BridgeState {
             proc.environment = env
 
             let outPipe = Pipe()
+            let errPipe = Pipe()
             proc.standardOutput = outPipe
-            proc.standardError = Pipe()
+            proc.standardError = errPipe
 
             do {
                 try proc.run()
                 let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                 proc.waitUntilExit()
-                return proc.terminationStatus == 0 ? data : nil
+                let errStr = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                return (proc.terminationStatus == 0 ? data : nil, errStr)
             } catch {
-                return nil
+                return (nil, error.localizedDescription)
             }
         }.value
     }
