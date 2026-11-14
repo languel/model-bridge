@@ -377,7 +377,7 @@ struct ContentView: View {
 
                 // Dynamic target options
                 switch state.targetFormat {
-                case .ollama, .ollamaMLX:
+                case .ollama, .ollamaGGUF, .ollamaMLX:
                     Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
                         if state.targetFormat == .ollamaMLX {
                             GridRow {
@@ -388,6 +388,20 @@ struct ContentView: View {
                                     Text("4-bit (Fastest)").tag(4)
                                     Text("8-bit (Balanced)").tag(8)
                                     Text("16-bit (BF16)").tag(16)
+                                }
+                                .pickerStyle(.segmented)
+                                .labelsHidden()
+                            }
+                        } else if state.targetFormat == .ollamaGGUF {
+                            GridRow {
+                                Text("GGUF Quant")
+                                    .frame(width: 100, alignment: .trailing)
+                                    .foregroundStyle(.secondary)
+                                Picker("GGUF Quant", selection: $state.ggufQuant) {
+                                    Text("Q4_K_M").tag("Q4_K_M")
+                                    Text("Q5_K_M").tag("Q5_K_M")
+                                    Text("Q8_0").tag("Q8_0")
+                                    Text("IQ4_NL").tag("IQ4_NL")
                                 }
                                 .pickerStyle(.segmented)
                                 .labelsHidden()

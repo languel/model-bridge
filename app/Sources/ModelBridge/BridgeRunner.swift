@@ -191,9 +191,15 @@ final class BridgeState {
             args.append(contentsOf: ["convert", sourcePath, "--to", targetFormat.rawValue])
 
             switch targetFormat {
-            case .ollama, .ollamaMLX:
+            case .ollama, .ollamaGGUF, .ollamaMLX:
                 if targetFormat == .ollamaMLX {
                     args.append(contentsOf: ["--bits", String(mlxBits)])
+                    let out = customOutputPath.trimmingCharacters(in: .whitespaces)
+                    if !out.isEmpty {
+                        args.append(contentsOf: ["--output", out])
+                    }
+                } else if targetFormat == .ollamaGGUF {
+                    args.append(contentsOf: ["--quant", ggufQuant])
                     let out = customOutputPath.trimmingCharacters(in: .whitespaces)
                     if !out.isEmpty {
                         args.append(contentsOf: ["--output", out])
@@ -444,7 +450,7 @@ final class BridgeState {
         createdOutputPathOnStart = nil
 
         if let tmpItems = try? fm.contentsOfDirectory(atPath: "/tmp") {
-            let prefixes = ["hf_from_gguf_", "hf_dequant_", "ollama_mlx_", "ollama_mlx_staged_", "mlx_staged_", "Modelfile_"]
+            let prefixes = ["hf_from_gguf_", "hf_dequant_", "ollama_mlx_", "ollama_mlx_staged_", "ollama_gguf_", "gguf_raw_", "mlx_staged_", "Modelfile_"]
             for item in tmpItems where prefixes.contains(where: { item.hasPrefix($0) }) {
                 try? fm.removeItem(atPath: "/tmp/\(item)")
             }

@@ -2,6 +2,7 @@ import Foundation
 
 enum TargetFormat: String, CaseIterable, Identifiable {
     case ollama = "ollama"
+    case ollamaGGUF = "ollama-gguf"
     case ollamaMLX = "ollama-mlx"
     case mlx = "mlx"
     case gguf = "gguf"
@@ -15,6 +16,7 @@ enum TargetFormat: String, CaseIterable, Identifiable {
     var displayName: String {
         switch self {
         case .ollama: return "Ollama"
+        case .ollamaGGUF: return "Ollama GGUF"
         case .ollamaMLX: return "Ollama MLX"
         case .mlx: return "MLX"
         case .gguf: return "GGUF"
@@ -27,7 +29,8 @@ enum TargetFormat: String, CaseIterable, Identifiable {
 
     var subtitle: String {
         switch self {
-        case .ollama: return "Import GGUF, MLX, or HF Safetensors into Ollama with a full Model Card"
+        case .ollama: return "Import GGUF, MLX, or HF Safetensors directly into Ollama with a full Model Card"
+        case .ollamaGGUF: return "Chain HF / Safetensors / MLX -> Quantized GGUF -> Ollama (llama.cpp backend)"
         case .ollamaMLX: return "Chain any model (HF, Safetensors, GGUF, Ollama) -> MLX -> Ollama MLX"
         case .mlx: return "Apple Silicon Metal native weights (4/8/16-bit) — chains HF, Safetensors, GGUF, or Ollama"
         case .gguf: return "Quantize GGUF via llama-quantize, or extract GGUF from Ollama"

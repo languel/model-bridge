@@ -1103,8 +1103,77 @@ def convert_to_ollama_mlx(
             shutil.rmtree(mlx_dir, ignore_errors=True)
 
 
+def _find_hf_to_gguf() -> Tuple[Optional[Path], Optional[Path]]:
+    """Locates the llama.cpp convert_hf_to_gguf.py script and its Python venv."""
+    root = Path(__file__).resolve().parent.parent
+    candidates = [
+        (root / ".gguf-venv" / "bin" / "python", root / "tools" / "llama_cpp_convert" / "convert_hf_to_gguf.py"),
+        (Path.home() / "dev" / "model-bridge" / ".gguf-venv" / "bin" / "python", Path.home() / "dev" / "model-bridge" / "tools" / "llama_cpp_convert" / "convert_hf_to_gguf.py"),
+    ]
+    for py, script in candidates:
+        if py.exists() and script.exists():
+            return py, script
+    return None, None
+
+
+def convert_to_ollama_gguf(
+    source: str,
+    model_name: Optional[str] = None,
+    quant: str = "Q4_K_M",
+    output_file: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    num_ctx: Optional[int] = None,
+    temperature: Optional[float] = None,
+    renderer: Optional[str] = None,
+    parser_name: Optional[str] = None,
+    capabilities: Optional[List[str]] = None,
+    move_source: bool = False,
+) -> bool:
+    """Chains any source (HF Hub, Safetensors, MLX, GGUF) -> quantized GGUF -> Ollama (llama.cpp backend)."""
+    info = inspect_model(source)
+    if "error" in info:
+        print(f"[-] Error inspecting source: {info['error']}", file=sys.stderr)
+        return False
+
+    q_upper = (quant or "Q4_K_M").upper()
+    raw_name = (model_name or info.get("name") or Path(info.get("path", "model")).stem).split(":")[0]
+    safe_name = raw_name.replace(":", "-").replace("/", "_")
+
+    if output_file:
+        gguf_path = Path(output_file).expanduser()
+        if gguf_path.is_dir() or gguf_path.suffix.lower() != ".gguf":
+            gguf_path.mkdir(parents=True, exist_ok=True)
+            gguf_path = gguf_path / f"{safe_name}_{q_upper}.gguf"
+        keep_gguf = True
+    else:
+        gguf_path = _register_temp_path(Path(f"/tmp/ollama_gguf_{safe_name}_{q_upper}.gguf"))
+        keep_gguf = False
+
+    print(f"[*] Step 1/2: Converting {info.get('format')} -> {q_upper} GGUF at '{gguf_path}'...")
+    if not quantize_gguf(source, target_quant=q_upper, output_file=str(gguf_path)):
+        return False
+
+    target_name = model_name or f"{safe_name.lower()}:{q_upper.lower()}"
+    print(f"[*] Step 2/2: Registering GGUF '{gguf_path.name}' as Ollama model '{target_name}'...")
+    try:
+        return convert_to_ollama(
+            str(gguf_path),
+            model_name=target_name,
+            system_prompt=system_prompt,
+            num_ctx=num_ctx,
+            temperature=temperature,
+            renderer=renderer,
+            parser_name=parser_name,
+            capabilities=capabilities,
+            move_source=move_source and keep_gguf,
+        )
+    finally:
+        if not keep_gguf and gguf_path.exists():
+            gguf_path.unlink(missing_ok=True)
+
+
 def quantize_gguf(source: str, target_quant: str = "Q4_K_M", output_file: Optional[str] = None) -> bool:
-    """Quantizes a GGUF file, or chains HF Hub / Safetensors / MLX -> quantized GGUF."""
+    """Quantizes a GGUF file, or chains HF Hub / Safetensors / MLX -> GGUF via llama.cpp convert_hf_to_gguf.py."""
     info = inspect_model(source)
     if "error" in info:
         print(f"[-] Error inspecting source: {info['error']}", file=sys.stderr)
@@ -1114,8 +1183,13 @@ def quantize_gguf(source: str, target_quant: str = "Q4_K_M", output_file: Option
     q_upper = (target_quant or "Q4_K_M").upper()
 
     if fmt in ("HuggingFace Hub", "HuggingFace Safetensors", "MLX"):
+        gguf_py, conv_script = _find_hf_to_gguf()
+        if not gguf_py or not conv_script:
+            print("[-] convert_hf_to_gguf.py not found in tools/llama_cpp_convert.", file=sys.stderr)
+            return False
+
         if fmt == "HuggingFace Hub":
-            print(f"[*] Step 1/3: Resolving HuggingFace Hub snapshot for '{info['repo_id']}'...")
+            print(f"[*] Resolving HuggingFace Hub snapshot for '{info['repo_id']}'...")
             snap = resolve_hf_hub_snapshot(info["repo_id"])
             if not snap:
                 return False
@@ -1128,7 +1202,7 @@ def quantize_gguf(source: str, target_quant: str = "Q4_K_M", output_file: Option
 
         if fmt == "MLX":
             temp_hf_dir = _register_temp_path(Path(f"/tmp/hf_dequant_{clean_stem}"))
-            print(f"[*] Step 1/3: Dequantizing MLX -> temporary Safetensors at '{temp_hf_dir}'...")
+            print(f"[*] Dequantizing MLX -> temporary Safetensors at '{temp_hf_dir}'...")
             if not convert_to_safetensors(str(src_path), output_dir=str(temp_hf_dir), dtype="bfloat16"):
                 return False
             src_path = temp_hf_dir
@@ -1144,16 +1218,34 @@ def quantize_gguf(source: str, target_quant: str = "Q4_K_M", output_file: Option
                 out_p = cand
         out_p.parent.mkdir(parents=True, exist_ok=True)
 
-        tmp_ol_name = f"_tmp_gguf_{clean_stem.lower()}_{os.getpid()}"
-        print(f"[*] Step 2/3: Importing & quantizing Safetensors -> {q_upper} GGUF via Ollama...")
+        direct_outtype = {"BF16": "bf16", "F16": "f16", "F32": "f32", "Q8_0": "q8_0"}.get(q_upper)
+        raw_gguf = out_p if direct_outtype else _register_temp_path(Path(f"/tmp/gguf_raw_{clean_stem}_{os.getpid()}.gguf"))
+        outtype = direct_outtype or "bf16"
+
         try:
-            ok = convert_to_ollama(str(src_path), model_name=tmp_ol_name, quant=q_upper)
-            if not ok:
-                return False
-            print(f"[*] Step 3/3: Exporting quantized GGUF to '{out_p}'...")
-            return export_ollama_model(tmp_ol_name, output_path=str(out_p), to_lmstudio=False, move=False)
+            print(f"[*] Converting Safetensors -> {outtype.upper()} GGUF via llama.cpp convert_hf_to_gguf.py...")
+            conv_cmd = [str(gguf_py), str(conv_script), str(src_path), "--outfile", str(raw_gguf), "--outtype", outtype]
+            print(f"[*] Running: {' '.join(conv_cmd)}")
+            subprocess.run(conv_cmd, check=True)
+
+            if not direct_outtype:
+                llama_quantize_bin = shutil.which("llama-quantize") or "/opt/homebrew/bin/llama-quantize"
+                if not Path(llama_quantize_bin).exists():
+                    print("[-] llama-quantize not found. Install via: brew install llama.cpp", file=sys.stderr)
+                    return False
+                print(f"[*] Quantizing GGUF -> {q_upper} via llama-quantize...")
+                q_cmd = [llama_quantize_bin, str(raw_gguf), str(out_p), q_upper]
+                print(f"[*] Running: {' '.join(q_cmd)}")
+                subprocess.run(q_cmd, check=True)
+
+            print(f"[+] Quantized GGUF saved to '{out_p}' ({round(out_p.stat().st_size / (1024**3), 2)} GB)!")
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"[-] HF -> GGUF conversion failed: {e}", file=sys.stderr)
+            return False
         finally:
-            delete_ollama_model(tmp_ol_name)
+            if not direct_outtype and raw_gguf.exists():
+                raw_gguf.unlink(missing_ok=True)
             if temp_hf_dir and temp_hf_dir.exists():
                 shutil.rmtree(temp_hf_dir, ignore_errors=True)
 
@@ -1568,13 +1660,9 @@ def convert_to_lmstudio(
         return convert_to_safetensors(source, output_dir=str(dest_dir), dtype=dtype)
 
     if lms_format == "gguf":
-        if fmt == "GGUF":
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            src_p = Path(info["path"])
-            out_gguf = dest_dir / f"{src_p.stem}_{quant.upper()}.gguf"
-            return quantize_gguf(source, target_quant=quant, output_file=str(out_gguf))
-        print(f"[-] Direct {fmt} -> GGUF for LM Studio requires a GGUF or Ollama source.", file=sys.stderr)
-        return False
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out_gguf = dest_dir / f"{repo_name}_{quant.upper()}.gguf"
+        return quantize_gguf(source, target_quant=quant, output_file=str(out_gguf))
 
     print(f"[-] Unsupported LM Studio format '{lms_format}'.", file=sys.stderr)
     return False
@@ -1804,7 +1892,7 @@ Examples:
     # Convert
     convert_parser = subparsers.add_parser("convert", help="Convert model between formats")
     convert_parser.add_argument("source", help="Source model file, HF directory, LM Studio ID, or 'ollama:<name>'")
-    convert_parser.add_argument("--to", required=True, choices=["ollama", "ollama-mlx", "mlx", "onnx", "gguf", "safetensors", "lmstudio"], help="Target format")
+    convert_parser.add_argument("--to", required=True, choices=["ollama", "ollama-gguf", "ollama-mlx", "mlx", "onnx", "gguf", "safetensors", "lmstudio"], help="Target format")
     convert_parser.add_argument("--name", help="Model name for Ollama")
     convert_parser.add_argument("--bits", type=int, default=4, choices=[4, 8, 16], help="Quantization bits for MLX (default: 4)")
     convert_parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"], help="Target dtype for Safetensors export")
@@ -1943,6 +2031,21 @@ Examples:
                 capabilities=caps,
                 move_source=args.move,
                 quant=args.quant,
+            )
+        elif args.to == "ollama-gguf":
+            caps = [c.strip() for c in args.capabilities.split(",")] if args.capabilities else None
+            ok = convert_to_ollama_gguf(
+                args.source,
+                model_name=args.name,
+                quant=args.quant or "Q4_K_M",
+                output_file=args.output,
+                system_prompt=args.system,
+                num_ctx=args.ctx,
+                temperature=args.temp,
+                renderer=args.renderer,
+                parser_name=args.parser_name,
+                capabilities=caps,
+                move_source=args.move,
             )
         elif args.to == "ollama-mlx":
             caps = [c.strip() for c in args.capabilities.split(",")] if args.capabilities else None
