@@ -372,21 +372,25 @@ def find_ollama_manifest(model_name: str) -> Optional[Path]:
     else:
         repo_part, tag = clean, "latest"
 
-    if "/" in repo_part:
-        rel = Path("registry.ollama.ai") / repo_part / tag
-    else:
-        rel = Path("registry.ollama.ai") / "library" / repo_part / tag
+    v2_candidates = [
+        OLLAMA_MODELS_DIR / "manifests-v2" / "ollama.com" / repo_part / tag,
+        OLLAMA_MODELS_DIR / "manifests-v2" / "ollama.com" / "library" / repo_part / tag,
+    ]
+    v1_rel = (Path("registry.ollama.ai") / repo_part / tag) if "/" in repo_part else (Path("registry.ollama.ai") / "library" / repo_part / tag)
+    v1_candidate = OLLAMA_MODELS_DIR / "manifests" / v1_rel
 
-    manifest_path = OLLAMA_MODELS_DIR / "manifests" / rel
-    if manifest_path.is_file():
-        return manifest_path
+    for cand in (*v2_candidates, v1_candidate):
+        if cand.is_file():
+            return cand
 
-    # Fallback: search manifests directory for matching repo/tag
-    manifests_root = OLLAMA_MODELS_DIR / "manifests"
-    if manifests_root.exists():
-        for p in manifests_root.rglob(tag):
-            if p.is_file() and p.parent.name == repo_part.split("/")[-1]:
-                return p
+    # Fallback: search manifests-v2 then manifests for matching repo/tag
+    target_parent = repo_part.split("/")[-1]
+    for root_name in ("manifests-v2", "manifests"):
+        manifests_root = OLLAMA_MODELS_DIR / root_name
+        if manifests_root.exists():
+            for p in manifests_root.rglob(tag):
+                if p.is_file() and p.parent.name == target_parent:
+                    return p
     return None
 
 
@@ -542,6 +546,9 @@ def export_ollama_model(
         (dest_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         out_blobs = dest_dir / "blobs"
         out_blobs.mkdir(exist_ok=True)
+        cfg_digest = (manifest.get("config") or {}).get("digest", "").replace(":", "-")
+        if cfg_digest and (blobs_dir / cfg_digest).exists():
+            shutil.copy2(blobs_dir / cfg_digest, out_blobs / cfg_digest)
         for l in layers:
             digest = l.get("digest", "").replace(":", "-")
             if not digest:
