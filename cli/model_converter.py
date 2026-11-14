@@ -753,8 +753,15 @@ def convert_to_ollama(
 
     print(f"[*] Preparing Ollama model '{model_name}' from {fmt}: {src_path.name} ({info.get('file_size_gb', 0)} GB)")
 
+    staged_ollama_dir: Optional[Path] = None
+    modelfile_src_path = src_path
+    if fmt == "MLX" and src_path.is_dir():
+        staged_ollama_dir = _stage_ollama_mlx_dir(src_path)
+        if staged_ollama_dir:
+            modelfile_src_path = staged_ollama_dir
+
     modelfile_content = build_modelfile(
-        src_path=src_path,
+        src_path=modelfile_src_path,
         info=info,
         system_prompt=system_prompt,
         num_ctx=num_ctx,
@@ -795,6 +802,8 @@ def convert_to_ollama(
     finally:
         if modelfile_path.exists():
             modelfile_path.unlink()
+        if staged_ollama_dir and staged_ollama_dir.exists():
+            shutil.rmtree(staged_ollama_dir, ignore_errors=True)
 
 
 MLX_MODEL_TYPE_ALIASES = {
@@ -838,8 +847,77 @@ def _stage_mlx_compatible_dir(src_dir: Path) -> Optional[Path]:
     if "vocab_size" not in cfg and text_cfg and "vocab_size" in text_cfg:
         cfg["vocab_size"] = text_cfg["vocab_size"]
 
+    # Strip multimodal config blocks when converting via text-only mlx_lm.convert
+    for mm_key in (
+        "audio_config", "vision_config",
+        "audio_token_id", "image_token_id", "video_token_id",
+        "boa_token_id", "boi_token_id", "eoa_token_index", "eoi_token_id",
+    ):
+        cfg.pop(mm_key, None)
+    if cfg.get("architectures") == ["Gemma4UnifiedForConditionalGeneration"]:
+        cfg["architectures"] = ["Gemma4ForCausalLM"]
+
     (staged_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    print(f"[*] Patched config.json model_type '{mtype}' -> '{cfg.get('model_type')}' for mlx-lm compatibility.")
+    print(f"[*] Patched config.json model_type '{mtype}' -> '{cfg.get('model_type')}' (text-only) for mlx-lm compatibility.")
+    return staged_dir
+
+
+def _stage_ollama_mlx_dir(src_dir: Path) -> Optional[Path]:
+    """If an MLX folder's config.json declares multimodal embedders missing from its weights, stage a cleaned config.json."""
+    cfg_path = src_dir / "config.json"
+    if not cfg_path.exists():
+        return None
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    has_mm_cfg = ("audio_config" in cfg) or ("vision_config" in cfg)
+    mtype = cfg.get("model_type")
+    needs_alias = mtype in MLX_MODEL_TYPE_ALIASES
+    if not has_mm_cfg and not needs_alias:
+        return None
+
+    # Check if multimodal weights actually exist in index
+    idx_path = src_dir / "model.safetensors.index.json"
+    has_mm_weights = False
+    if idx_path.exists():
+        try:
+            wmap = json.loads(idx_path.read_text(encoding="utf-8")).get("weight_map", {})
+            has_mm_weights = any(("embed_audio" in k or "embed_vision" in k or "audio_tower" in k or "vision_tower" in k) for k in wmap.keys())
+        except Exception:
+            pass
+
+    if has_mm_weights and not needs_alias:
+        return None
+
+    staged_dir = _register_temp_path(Path(f"/tmp/ollama_mlx_staged_{src_dir.name}"))
+    if staged_dir.exists():
+        shutil.rmtree(staged_dir, ignore_errors=True)
+    staged_dir.mkdir(parents=True, exist_ok=True)
+
+    for item in src_dir.iterdir():
+        if item.name == "config.json":
+            continue
+        (staged_dir / item.name).symlink_to(item)
+
+    if needs_alias:
+        cfg["model_type"] = MLX_MODEL_TYPE_ALIASES[mtype]
+    text_cfg = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else None
+    if text_cfg and text_cfg.get("model_type") in MLX_MODEL_TYPE_ALIASES:
+        text_cfg["model_type"] = MLX_MODEL_TYPE_ALIASES[text_cfg["model_type"]]
+    if not has_mm_weights:
+        for mm_key in (
+            "audio_config", "vision_config",
+            "audio_token_id", "image_token_id", "video_token_id",
+            "boa_token_id", "boi_token_id", "eoa_token_index", "eoi_token_id",
+        ):
+            cfg.pop(mm_key, None)
+        if cfg.get("architectures") == ["Gemma4UnifiedForConditionalGeneration"]:
+            cfg["architectures"] = ["Gemma4ForCausalLM"]
+
+    (staged_dir / "config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    print("[*] Cleaned orphan multimodal config keys from MLX config.json for Ollama MLX runner.")
     return staged_dir
 
 

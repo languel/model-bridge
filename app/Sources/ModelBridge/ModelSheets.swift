@@ -201,3 +201,111 @@ struct ModelCardEditorSheet: View {
         }
     }
 }
+
+struct TestModelSheet: View {
+    @Bindable var state: BridgeState
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var prompt: String = "Say hello and confirm you are working."
+    @State private var maxTokens: Int = 256
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Test Model")
+                        .font(.title3.weight(.bold))
+                    Text(state.sourcePath)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if let fmt = state.inspectedModel?.format {
+                    BadgeView(text: fmt, color: .blue)
+                }
+                Button("Done") {
+                    state.stopModelTest()
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+            }
+
+            HStack(spacing: 8) {
+                TextField("Enter a test message…", text: $prompt)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit {
+                        if !state.isTestingModel {
+                            state.runModelTest(source: state.sourcePath, prompt: prompt, maxTokens: maxTokens)
+                        }
+                    }
+
+                Picker("Max Tokens", selection: $maxTokens) {
+                    Text("64").tag(64)
+                    Text("128").tag(128)
+                    Text("256").tag(256)
+                    Text("512").tag(512)
+                }
+                .frame(width: 85)
+
+                if state.isTestingModel {
+                    Button(role: .destructive) {
+                        state.stopModelTest()
+                    } label: {
+                        Label("Stop", systemImage: "stop.fill")
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.red)
+                } else {
+                    Button {
+                        state.runModelTest(source: state.sourcePath, prompt: prompt, maxTokens: maxTokens)
+                    } label: {
+                        Label("Send", systemImage: "paperplane.fill")
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.accentColor)
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(state.testOutput.isEmpty ? (state.isTestingModel ? "Waiting for tokens…" : "Send a message to test inference.") : state.testOutput)
+                        .font(.system(size: 12.5, design: .monospaced))
+                        .foregroundStyle(state.testOutput.isEmpty ? .secondary : .primary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .id("testEnd")
+                }
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.2)))
+                .onChange(of: state.testOutput) {
+                    proxy.scrollTo("testEnd", anchor: .bottom)
+                }
+            }
+
+            HStack {
+                if state.isTestingModel {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+                Text(state.testStatusNote)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Copy Output") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(state.testOutput, forType: .string)
+                }
+                .controlSize(.small)
+                .disabled(state.testOutput.isEmpty)
+            }
+        }
+        .padding(18)
+        .frame(minWidth: 600, minHeight: 420)
+    }
+}

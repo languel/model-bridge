@@ -44,8 +44,13 @@ final class BridgeState {
     var progressMessage: String = ""
     var isRefreshing: Bool = false
     var isInspecting: Bool = false
+    var isTestingModel: Bool = false
+    var testOutput: String = ""
+    var testStatusNote: String = ""
 
     private var activeProcess: Process?
+    private var testTask: Task<Void, Never>?
+    private var testProcess: Process?
     private var createdOutputPathOnStart: String?
 
     /// Resolves the path to `cli/model_converter.py`.
@@ -435,7 +440,7 @@ final class BridgeState {
         createdOutputPathOnStart = nil
 
         if let tmpItems = try? fm.contentsOfDirectory(atPath: "/tmp") {
-            let prefixes = ["hf_from_gguf_", "hf_dequant_", "ollama_mlx_", "mlx_staged_", "Modelfile_"]
+            let prefixes = ["hf_from_gguf_", "hf_dequant_", "ollama_mlx_", "ollama_mlx_staged_", "mlx_staged_", "Modelfile_"]
             for item in tmpItems where prefixes.contains(where: { item.hasPrefix($0) }) {
                 try? fm.removeItem(atPath: "/tmp/\(item)")
             }
@@ -462,6 +467,185 @@ final class BridgeState {
             inspectedModel = nil
         }
         await refreshAll()
+    }
+
+    // MARK: - In-App Model Test
+
+    func runModelTest(source: String, prompt: String, maxTokens: Int = 256) {
+        stopModelTest()
+        let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPrompt.isEmpty else { return }
+
+        isTestingModel = true
+        testOutput = ""
+        testStatusNote = "Loading model…"
+
+        let fmt = inspectedModel?.format ?? ""
+        testTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.isTestingModel = false
+                self.testProcess = nil
+            }
+
+            if source.hasPrefix("ollama:") {
+                let modelName = String(source.dropFirst("ollama:".count))
+                await self.streamOllamaChat(model: modelName, prompt: trimmedPrompt, maxTokens: maxTokens)
+            } else if fmt == "MLX" || FileManager.default.fileExists(atPath: source) && !source.lowercased().hasSuffix(".gguf") {
+                await self.streamLocalCLI(
+                    executable: "/opt/homebrew/bin/mlx_lm.generate",
+                    args: ["--model", source, "--prompt", trimmedPrompt, "--max-tokens", String(maxTokens)]
+                )
+            } else if source.lowercased().hasSuffix(".gguf") {
+                await self.streamLocalCLI(
+                    executable: "/opt/homebrew/bin/llama-cli",
+                    args: ["-m", source, "-p", trimmedPrompt, "-n", String(maxTokens), "-no-cnv"]
+                )
+            } else {
+                self.testStatusNote = "Test is supported for Ollama, local MLX/Safetensors, and GGUF models."
+            }
+        }
+    }
+
+    func stopModelTest() {
+        testTask?.cancel()
+        testTask = nil
+        if let proc = testProcess {
+            proc.terminate()
+            kill(-proc.processIdentifier, SIGTERM)
+        }
+        testProcess = nil
+        if isTestingModel {
+            isTestingModel = false
+            testStatusNote = "Stopped"
+        }
+    }
+
+    private func streamOllamaChat(model: String, prompt: String, maxTokens: Int) async {
+        guard let url = URL(string: "http://127.0.0.1:11434/api/chat") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 180
+
+        let payload: [String: Any] = [
+            "model": model,
+            "messages": [["role": "user", "content": prompt]],
+            "stream": true,
+            "options": ["num_predict": maxTokens]
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+
+        let started = Date()
+        testStatusNote = "Generating…"
+
+        do {
+            let (bytes, response) = try await URLSession.shared.bytes(for: req)
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                var errBody = ""
+                for try await line in bytes.lines { errBody += line }
+                testStatusNote = "HTTP \(http.statusCode)"
+                testOutput = errBody.isEmpty ? "Ollama returned HTTP \(http.statusCode)" : errBody
+                return
+            }
+
+            var inThinking = false
+            for try await line in bytes.lines {
+                if Task.isCancelled { break }
+                guard let data = line.data(using: .utf8),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+
+                if let err = obj["error"] as? String {
+                    testStatusNote = "Error"
+                    testOutput += "\n[Error] \(err)"
+                    return
+                }
+                if let msg = obj["message"] as? [String: Any] {
+                    if let think = msg["thinking"] as? String, !think.isEmpty {
+                        if !inThinking {
+                            testOutput += "<think>\n"
+                            inThinking = true
+                        }
+                        testOutput += think
+                    }
+                    if let content = msg["content"] as? String, !content.isEmpty {
+                        if inThinking {
+                            testOutput += "\n</think>\n\n"
+                            inThinking = false
+                        }
+                        testOutput += content
+                    }
+                }
+                if (obj["done"] as? Bool) == true {
+                    let elapsed = Date().timeIntervalSince(started)
+                    if let evalCount = obj["eval_count"] as? Int,
+                       let evalNs = obj["eval_duration"] as? Double, evalNs > 0 {
+                        let tokPerSec = Double(evalCount) / (evalNs / 1_000_000_000.0)
+                        testStatusNote = String(format: "%d tokens · %.1f tok/s · %.1fs", evalCount, tokPerSec, elapsed)
+                    } else {
+                        testStatusNote = String(format: "Done in %.1fs", elapsed)
+                    }
+                }
+            }
+        } catch {
+            if !Task.isCancelled {
+                testStatusNote = "Failed"
+                testOutput = error.localizedDescription
+            }
+        }
+    }
+
+    private func streamLocalCLI(executable: String, args: [String]) async {
+        guard FileManager.default.fileExists(atPath: executable) else {
+            testStatusNote = "Missing \(URL(fileURLWithPath: executable).lastPathComponent)"
+            testOutput = "Executable not found at \(executable). Import to Ollama or LM Studio to test."
+            return
+        }
+
+        let started = Date()
+        testStatusNote = "Running \(URL(fileURLWithPath: executable).lastPathComponent)…"
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: executable)
+        proc.arguments = args
+        var env = ProcessInfo.processInfo.environment
+        let existingPath = env["PATH"] ?? "/usr/bin:/bin"
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:\(existingPath)"
+        env["PYTHONUNBUFFERED"] = "1"
+        proc.environment = env
+
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+            Task { @MainActor [weak self] in
+                self?.testOutput.append(chunk)
+            }
+        }
+
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            proc.terminationHandler = { [weak self] p in
+                pipe.fileHandleForReading.readabilityHandler = nil
+                Task { @MainActor [weak self] in
+                    let elapsed = Date().timeIntervalSince(started)
+                    self?.testStatusNote = p.terminationStatus == 0
+                        ? String(format: "Done in %.1fs", elapsed)
+                        : "Exited with code \(p.terminationStatus)"
+                    cont.resume()
+                }
+            }
+            do {
+                self.testProcess = proc
+                try proc.run()
+            } catch {
+                self.testStatusNote = "Launch failed"
+                self.testOutput = error.localizedDescription
+                cont.resume()
+            }
+        }
     }
 
     private func runSimple(args: [String]) async -> Bool {

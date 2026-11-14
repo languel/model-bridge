@@ -10,6 +10,7 @@ struct ContentView: View {
     @State private var pendingDeleteLMStudio: LMStudioModel?
     @State private var showingInspectSheet = false
     @State private var showingCardEditor = false
+    @State private var showingTestSheet = false
     @State private var editingCard = EditableModelCard()
 
     var body: some View {
@@ -115,6 +116,9 @@ struct ContentView: View {
                     )
                 }
             )
+        }
+        .sheet(isPresented: $showingTestSheet) {
+            TestModelSheet(state: state)
         }
     }
 
@@ -291,6 +295,17 @@ struct ContentView: View {
                             Spacer()
 
                             if state.sourcePath.hasPrefix("ollama:") || FileManager.default.fileExists(atPath: state.sourcePath) {
+                                Button {
+                                    state.testOutput = ""
+                                    state.testStatusNote = ""
+                                    showingTestSheet = true
+                                } label: {
+                                    Label("Test…", systemImage: "play.circle")
+                                }
+                                .controlSize(.small)
+                                .buttonStyle(.bordered)
+                                .help("Send a quick test message to this model")
+
                                 Button {
                                     Task {
                                         if let loaded = await state.fetchModelCard(for: state.sourcePath), loaded.error == nil {
