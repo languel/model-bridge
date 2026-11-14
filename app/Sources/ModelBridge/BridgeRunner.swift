@@ -19,6 +19,7 @@ final class BridgeState {
     var targetFormat: TargetFormat = .ollama
 
     // Target-specific options
+    var ollamaImportMode: String = "ollama" // "ollama" (direct), "ollama-gguf", "ollama-mlx"
     var ollamaModelName: String = ""
     var ollamaSystemPrompt: String = ""
     var ollamaNumCtx: Int = 32768
@@ -109,12 +110,29 @@ final class BridgeState {
         self.sourcePath = path
         if path.hasPrefix("ollama:") {
             self.ollamaModelName = String(path.dropFirst("ollama:".count))
+        } else if path.hasPrefix("hf:"), let hashIdx = path.firstIndex(of: "#") {
+            let fname = String(path[path.index(after: hashIdx)...])
+            let base = URL(fileURLWithPath: fname).deletingPathExtension().lastPathComponent
+                .lowercased()
+                .replacingOccurrences(of: "_", with: "-")
+                .replacingOccurrences(of: " ", with: "-")
+            self.ollamaModelName = base
+            if fname.lowercased().hasSuffix(".gguf") {
+                self.targetFormat = .ollama
+                self.ollamaImportMode = "ollama"
+                self.ollamaQuant = ""
+            }
         } else {
             let base = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
                 .lowercased()
                 .replacingOccurrences(of: "_", with: "-")
                 .replacingOccurrences(of: " ", with: "-")
             self.ollamaModelName = base
+            if path.lowercased().hasSuffix(".gguf") {
+                self.targetFormat = .ollama
+                self.ollamaImportMode = "ollama"
+                self.ollamaQuant = ""
+            }
         }
         Task {
             await inspectSource(path)
@@ -188,17 +206,18 @@ final class BridgeState {
                 args.append("--move")
             }
         } else {
-            args.append(contentsOf: ["convert", sourcePath, "--to", targetFormat.rawValue])
+            let cliTarget = (targetFormat == .ollama) ? ollamaImportMode : targetFormat.rawValue
+            args.append(contentsOf: ["convert", sourcePath, "--to", cliTarget])
 
             switch targetFormat {
-            case .ollama, .ollamaGGUF, .ollamaMLX:
-                if targetFormat == .ollamaMLX {
+            case .ollama:
+                if ollamaImportMode == "ollama-mlx" {
                     args.append(contentsOf: ["--bits", String(mlxBits)])
                     let out = customOutputPath.trimmingCharacters(in: .whitespaces)
                     if !out.isEmpty {
                         args.append(contentsOf: ["--output", out])
                     }
-                } else if targetFormat == .ollamaGGUF {
+                } else if ollamaImportMode == "ollama-gguf" {
                     args.append(contentsOf: ["--quant", ggufQuant])
                     let out = customOutputPath.trimmingCharacters(in: .whitespaces)
                     if !out.isEmpty {
@@ -221,7 +240,7 @@ final class BridgeState {
                 if !ollamaCapabilities.trimmingCharacters(in: .whitespaces).isEmpty {
                     args.append(contentsOf: ["--capabilities", ollamaCapabilities.trimmingCharacters(in: .whitespaces)])
                 }
-                if targetFormat == .ollama && !ollamaQuant.isEmpty {
+                if ollamaImportMode == "ollama" && !ollamaQuant.isEmpty {
                     args.append(contentsOf: ["--quant", ollamaQuant])
                 }
                 if moveToOllama {

@@ -385,6 +385,14 @@ struct ExploreView: View {
                                                 .font(.caption.monospacedDigit())
                                                 .foregroundStyle(.secondary)
                                         }
+                                        if file.rfilename.lowercased().hasSuffix(".gguf") {
+                                            Button("Use File") {
+                                                onSelectForBridge("hf:\(model.id)#\(file.rfilename)")
+                                            }
+                                            .controlSize(.mini)
+                                            .buttonStyle(.bordered)
+                                            .help("Load just this GGUF file in Bridge & Convert")
+                                        }
                                     }
                                     if file.id != weightFiles.prefix(20).last?.id {
                                         Divider()

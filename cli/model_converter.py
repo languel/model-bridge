@@ -180,9 +180,17 @@ def inspect_hf_or_mlx(dir_path: Path) -> Dict[str, Any]:
     return info
 
 
+def _split_hf_spec(spec: str) -> Tuple[str, Optional[str]]:
+    clean = spec.replace("hf:", "", 1).strip()
+    if "#" in clean:
+        repo, fname = clean.split("#", 1)
+        return repo.strip(), fname.strip() or None
+    return clean, None
+
+
 def is_hf_repo_id(target: str) -> bool:
-    """Returns True if target looks like a Hugging Face repo ID ('owner/repo' or 'hf:owner/repo')."""
-    clean = target.replace("hf:", "", 1).strip()
+    """Returns True if target looks like a Hugging Face repo ID ('owner/repo' or 'hf:owner/repo#file')."""
+    clean, _ = _split_hf_spec(target)
     if clean.startswith("/") or clean.startswith("~") or clean.startswith("."):
         return False
     parts = clean.split("/")
@@ -192,14 +200,16 @@ def is_hf_repo_id(target: str) -> bool:
 def inspect_hf_hub(repo_id: str) -> Dict[str, Any]:
     """Fetches config.json from Hugging Face Hub without downloading weights."""
     import urllib.request
-    clean_id = repo_id.replace("hf:", "", 1).strip()
+    clean_id, filename = _split_hf_spec(repo_id)
     url = f"https://huggingface.co/{clean_id}/resolve/main/config.json"
     info: Dict[str, Any] = {
         "format": "HuggingFace Hub",
-        "path": f"hf:{clean_id}",
+        "path": f"hf:{clean_id}" + (f"#{filename}" if filename else ""),
         "repo_id": clean_id,
-        "name": clean_id.split("/")[-1],
+        "name": Path(filename).stem if filename else clean_id.split("/")[-1],
     }
+    if filename:
+        info["filename"] = filename
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "model-bridge/1.0"})
         with urllib.request.urlopen(req, timeout=6) as resp:
@@ -212,15 +222,35 @@ def inspect_hf_hub(repo_id: str) -> Dict[str, Any]:
             qcfg = cfg.get("quantization") or cfg.get("quantization_config")
             info["quantization"] = qcfg if isinstance(qcfg, dict) else {}
     except Exception as e:
-        info["error"] = f"Could not fetch HuggingFace config for '{clean_id}': {e}"
+        if filename and filename.lower().endswith(".gguf"):
+            info["architecture"] = "gguf"
+        else:
+            info["error"] = f"Could not fetch HuggingFace config for '{clean_id}': {e}"
     return info
 
 
 def resolve_hf_hub_snapshot(repo_id: str) -> Optional[Path]:
-    """Downloads (or resolves cached) Hugging Face repo snapshot via huggingface_hub."""
-    clean_id = repo_id.replace("hf:", "", 1).strip()
+    """Downloads (or resolves cached) Hugging Face repo snapshot or single file via huggingface_hub."""
+    clean_id, filename = _split_hf_spec(repo_id)
     mlx_py = "/opt/homebrew/Cellar/mlx-lm/0.31.3_2/libexec/bin/python"
     py_exec = mlx_py if Path(mlx_py).exists() else sys.executable
+    if filename:
+        print(f"[*] Resolving Hugging Face file '{clean_id} / {filename}' (downloading/caching)...")
+        code = (
+            "import sys; "
+            "from huggingface_hub import hf_hub_download; "
+            "print(hf_hub_download(repo_id=sys.argv[1], filename=sys.argv[2]))"
+        )
+        res = subprocess.run([py_exec, "-c", code, clean_id, filename], capture_output=True, text=True)
+        if res.returncode == 0:
+            out_path = res.stdout.strip().splitlines()[-1].strip()
+            p = Path(out_path)
+            if p.is_file():
+                print(f"[+] File ready at: {p}")
+                return p
+        print(f"[-] Failed to download HF file '{clean_id}/{filename}': {res.stderr}", file=sys.stderr)
+        return None
+
     print(f"[*] Resolving Hugging Face Hub repo '{clean_id}' (downloading/caching snapshot)...")
     code = (
         "import sys; "
@@ -733,7 +763,7 @@ def convert_to_ollama(
 
     fmt = info.get("format", "unknown")
     if fmt == "HuggingFace Hub":
-        snap = resolve_hf_hub_snapshot(info["repo_id"])
+        snap = resolve_hf_hub_snapshot(info["path"])
         if not snap:
             return False
         info = inspect_model(str(snap))
@@ -1054,7 +1084,7 @@ def convert_to_ollama_mlx(
 
     if fmt == "HuggingFace Hub":
         print(f"[*] Step 1/3: Resolving HuggingFace Hub snapshot for '{info['repo_id']}'...")
-        snap = resolve_hf_hub_snapshot(info["repo_id"])
+        snap = resolve_hf_hub_snapshot(info["path"])
         if not snap:
             return False
         resolved_source = str(snap)
@@ -1190,7 +1220,7 @@ def quantize_gguf(source: str, target_quant: str = "Q4_K_M", output_file: Option
 
         if fmt == "HuggingFace Hub":
             print(f"[*] Resolving HuggingFace Hub snapshot for '{info['repo_id']}'...")
-            snap = resolve_hf_hub_snapshot(info["repo_id"])
+            snap = resolve_hf_hub_snapshot(info["path"])
             if not snap:
                 return False
             info = inspect_model(str(snap))
@@ -1291,7 +1321,7 @@ def convert_to_safetensors(source: str, output_dir: Optional[str] = None, dtype:
 
     fmt = info.get("format", "")
     if fmt == "HuggingFace Hub":
-        snap = resolve_hf_hub_snapshot(info["repo_id"])
+        snap = resolve_hf_hub_snapshot(info["path"])
         if not snap:
             return False
         info = inspect_model(str(snap))
@@ -1470,7 +1500,7 @@ def convert_to_onnx(source: str, output_dir: Optional[str] = None, onnx_quant: s
     temp_hf_dir: Optional[Path] = None
 
     if fmt == "HuggingFace Hub":
-        snap = resolve_hf_hub_snapshot(info["repo_id"])
+        snap = resolve_hf_hub_snapshot(info["path"])
         if not snap:
             return False
         info = inspect_model(str(snap))

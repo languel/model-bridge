@@ -377,9 +377,27 @@ struct ContentView: View {
 
                 // Dynamic target options
                 switch state.targetFormat {
-                case .ollama, .ollamaGGUF, .ollamaMLX:
+                case .ollama:
                     Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
-                        if state.targetFormat == .ollamaMLX {
+                        GridRow {
+                            Text("Import Mode")
+                                .frame(width: 100, alignment: .trailing)
+                                .foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Picker("Import Mode", selection: $state.ollamaImportMode) {
+                                    Text("Direct Import (As-Is)").tag("ollama")
+                                    Text("Build GGUF → Ollama").tag("ollama-gguf")
+                                    Text("Build MLX → Ollama").tag("ollama-mlx")
+                                }
+                                .pickerStyle(.segmented)
+                                .labelsHidden()
+
+                                Text(ollamaModeDescription(state.ollamaImportMode))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        if state.ollamaImportMode == "ollama-mlx" {
                             GridRow {
                                 Text("MLX Precision")
                                     .frame(width: 100, alignment: .trailing)
@@ -392,7 +410,7 @@ struct ContentView: View {
                                 .pickerStyle(.segmented)
                                 .labelsHidden()
                             }
-                        } else if state.targetFormat == .ollamaGGUF {
+                        } else if state.ollamaImportMode == "ollama-gguf" {
                             GridRow {
                                 Text("GGUF Quant")
                                     .frame(width: 100, alignment: .trailing)
@@ -402,6 +420,21 @@ struct ContentView: View {
                                     Text("Q5_K_M").tag("Q5_K_M")
                                     Text("Q8_0").tag("Q8_0")
                                     Text("IQ4_NL").tag("IQ4_NL")
+                                }
+                                .pickerStyle(.segmented)
+                                .labelsHidden()
+                            }
+                        } else {
+                            GridRow {
+                                Text("Quantize")
+                                    .frame(width: 100, alignment: .trailing)
+                                    .foregroundStyle(.secondary)
+                                Picker("Ollama Quant", selection: $state.ollamaQuant) {
+                                    Text("Original / Pre-built").tag("")
+                                    Text("INT4").tag("int4")
+                                    Text("INT8").tag("int8")
+                                    Text("MXFP4").tag("mxfp4")
+                                    Text("NVFP4").tag("nvfp4")
                                 }
                                 .pickerStyle(.segmented)
                                 .labelsHidden()
@@ -451,22 +484,6 @@ struct ContentView: View {
                                 .foregroundStyle(.secondary)
                             TextField("Optional system instruction", text: $state.ollamaSystemPrompt)
                                 .textFieldStyle(.roundedBorder)
-                        }
-                        if state.targetFormat == .ollama {
-                            GridRow {
-                                Text("Quantize")
-                                    .frame(width: 100, alignment: .trailing)
-                                    .foregroundStyle(.secondary)
-                                Picker("Ollama Quant", selection: $state.ollamaQuant) {
-                                    Text("Original (BF16/F16)").tag("")
-                                    Text("INT4").tag("int4")
-                                    Text("INT8").tag("int8")
-                                    Text("MXFP4").tag("mxfp4")
-                                    Text("NVFP4").tag("nvfp4")
-                                }
-                                .pickerStyle(.segmented)
-                                .labelsHidden()
-                            }
                         }
                         GridRow {
                             Text("")
@@ -866,6 +883,17 @@ struct ContentView: View {
             }
         }
         return true
+    }
+
+    private func ollamaModeDescription(_ mode: String) -> String {
+        switch mode {
+        case "ollama-gguf":
+            return "Converts Safetensors / HF / MLX -> quantized GGUF (Q4_K_M, Q5_K_M, Q8_0, IQ4_NL) -> Ollama llama.cpp backend."
+        case "ollama-mlx":
+            return "Converts HF / Safetensors / GGUF -> Apple Silicon MLX (4/8/16-bit) -> Ollama MLX backend."
+        default:
+            return "Imports an existing .gguf file or folder directly via `ollama create` (supports native int4/int8/mxfp4 for Safetensors)."
+        }
     }
 
     private func formatColor(_ fmt: String?) -> Color {
