@@ -23,6 +23,10 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 cp "$BIN_PATH" "$APP_BUNDLE/Contents/MacOS/ModelBridge"
 chmod +x "$APP_BUNDLE/Contents/MacOS/ModelBridge"
 
+if [[ -f "$APP_DIR/Resources/AppIcon.icns" ]]; then
+    cp "$APP_DIR/Resources/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+fi
+
 cat > "$APP_BUNDLE/Contents/Info.plist" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -32,6 +36,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'EOF'
     <string>en</string>
     <key>CFBundleExecutable</key>
     <string>ModelBridge</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.languel.modelbridge</string>
     <key>CFBundleInfoDictionaryVersion</key>

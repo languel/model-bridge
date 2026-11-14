@@ -257,35 +257,93 @@ def find_ollama_manifest(model_name: str) -> Optional[Path]:
     return None
 
 
+def get_ollama_modelfile_blob(model_name: str) -> Tuple[Optional[Path], str]:
+    """Runs `ollama show <name> --modelfile` and extracts the FROM blob path if present."""
+    res = subprocess.run(["ollama", "show", model_name, "--modelfile"], capture_output=True, text=True)
+    if res.returncode != 0:
+        return None, ""
+    mf_text = res.stdout
+    for line in mf_text.splitlines():
+        if line.startswith("FROM "):
+            target = line[5:].strip()
+            p = Path(target)
+            if p.is_file():
+                return p, mf_text
+    return None, mf_text
+
+
+def get_ollama_show_metadata(model_name: str) -> Dict[str, Any]:
+    """Parses architecture, parameters, quantization from `ollama show <name>`."""
+    res = subprocess.run(["ollama", "show", model_name], capture_output=True, text=True)
+    meta: Dict[str, Any] = {}
+    if res.returncode != 0:
+        return meta
+    for line in res.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2:
+            k, v = parts[0].lower(), parts[1].strip()
+            if k in ("architecture", "parameters", "quantization", "renderer", "parser"):
+                meta[k] = v
+    return meta
+
+
 def inspect_ollama_model(model_name: str) -> Dict[str, Any]:
-    """Inspects an Ollama model's manifest and underlying weight format (GGUF vs MLX/Safetensors)."""
+    """Inspects an Ollama model via its manifest file or `ollama show` (for db.sqlite custom models)."""
     manifest_path = find_ollama_manifest(model_name)
-    if not manifest_path:
-        return {"error": f"Manifest not found for Ollama model '{model_name}'."}
+    if manifest_path:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            layers = manifest.get("layers", [])
+            runner = manifest.get("runner", "")
+            fmt = manifest.get("format", "")
+            model_blobs = [l for l in layers if l.get("mediaType") == "application/vnd.ollama.image.model"]
+            tensor_blobs = [l for l in layers if l.get("mediaType") == "application/vnd.ollama.image.tensor"]
 
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        return {"error": f"Failed to parse manifest: {e}"}
+            total_bytes = sum(l.get("size", 0) for l in layers)
+            backend = "GGUF" if model_blobs else ("MLX/Safetensors" if (runner == "mlx" or fmt == "safetensors" or tensor_blobs) else "Unknown")
 
-    layers = manifest.get("layers", [])
-    runner = manifest.get("runner", "")
-    fmt = manifest.get("format", "")
-    model_blobs = [l for l in layers if l.get("mediaType") == "application/vnd.ollama.image.model"]
-    tensor_blobs = [l for l in layers if l.get("mediaType") == "application/vnd.ollama.image.tensor"]
+            return {
+                "name": model_name,
+                "format": f"Ollama ({backend})",
+                "backend": backend,
+                "manifest_path": str(manifest_path),
+                "file_size_gb": round(total_bytes / (1024**3), 2),
+                "num_layers": len(layers),
+                "has_single_gguf": len(model_blobs) == 1,
+            }
+        except Exception as e:
+            return {"error": f"Failed to parse manifest: {e}"}
 
-    total_bytes = sum(l.get("size", 0) for l in layers)
-    backend = "GGUF" if model_blobs else ("MLX/Safetensors" if (runner == "mlx" or fmt == "safetensors" or tensor_blobs) else "Unknown")
+    # Fallback for Ollama db.sqlite custom models (`ollama create`)
+    blob_path, mf_text = get_ollama_modelfile_blob(model_name)
+    meta = get_ollama_show_metadata(model_name)
+    if blob_path and blob_path.exists():
+        is_gguf = False
+        try:
+            with open(blob_path, "rb") as f:
+                is_gguf = f.read(4) == GGUF_MAGIC
+        except Exception:
+            pass
+        backend = "GGUF" if is_gguf else "Blob"
+        return {
+            "name": model_name,
+            "format": f"Ollama ({backend})",
+            "backend": backend,
+            "architecture": meta.get("architecture"),
+            "path": str(blob_path),
+            "file_size_gb": round(blob_path.stat().st_size / (1024**3), 2),
+            "has_single_gguf": is_gguf,
+        }
+    elif mf_text:
+        return {
+            "name": model_name,
+            "format": "Ollama (Custom/MLX)",
+            "backend": "Custom/MLX",
+            "architecture": meta.get("architecture"),
+            "has_single_gguf": False,
+        }
 
-    return {
-        "name": model_name,
-        "format": f"Ollama ({backend})",
-        "backend": backend,
-        "manifest_path": str(manifest_path),
-        "file_size_gb": round(total_bytes / (1024**3), 2),
-        "num_layers": len(layers),
-        "has_single_gguf": len(model_blobs) == 1,
-    }
+    return {"error": f"Manifest or model data not found for Ollama model '{model_name}'."}
 
 
 def export_ollama_model(
@@ -296,16 +354,7 @@ def export_ollama_model(
 ) -> bool:
     """Exports an Ollama model to GGUF (or self-contained bundle) and optionally imports to LM Studio."""
     manifest_path = find_ollama_manifest(model_name)
-    if not manifest_path:
-        print(f"[-] Could not find Ollama manifest for '{model_name}'.", file=sys.stderr)
-        return False
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    layers = manifest.get("layers", [])
-    blobs_dir = OLLAMA_MODELS_DIR / "blobs"
     safe_name = model_name.replace(":", "-").replace("/", "_")
-
-    model_layers = [l for l in layers if l.get("mediaType") == "application/vnd.ollama.image.model"]
 
     if to_lmstudio:
         dest_dir = LM_STUDIO_MODELS_DIR / "ollama-export" / safe_name
@@ -318,31 +367,42 @@ def export_ollama_model(
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     # Save Modelfile
-    modelfile_res = subprocess.run(["ollama", "show", model_name, "--modelfile"], capture_output=True, text=True)
-    if modelfile_res.returncode == 0:
-        (dest_dir / "Modelfile").write_text(modelfile_res.stdout, encoding="utf-8")
+    blob_path, mf_text = get_ollama_modelfile_blob(model_name)
+    if mf_text:
+        (dest_dir / "Modelfile").write_text(mf_text, encoding="utf-8")
 
-    if len(model_layers) == 1:
-        digest = model_layers[0]["digest"].replace(":", "-")
-        blob_file = blobs_dir / digest
-        if not blob_file.exists():
-            print(f"[-] Blob missing: {blob_file}", file=sys.stderr)
-            return False
+    # Resolve single GGUF blob either from manifest or from `ollama show --modelfile`
+    single_gguf_blob: Optional[Path] = None
+    manifest = None
+    layers = []
 
+    if manifest_path:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        layers = manifest.get("layers", [])
+        blobs_dir = OLLAMA_MODELS_DIR / "blobs"
+        model_layers = [l for l in layers if l.get("mediaType") == "application/vnd.ollama.image.model"]
+        if len(model_layers) == 1:
+            candidate = blobs_dir / model_layers[0]["digest"].replace(":", "-")
+            if candidate.exists():
+                single_gguf_blob = candidate
+    elif blob_path and blob_path.exists():
+        single_gguf_blob = blob_path
+
+    if single_gguf_blob:
         if output_path and Path(output_path).suffix.lower() == ".gguf" and not to_lmstudio:
             gguf_dest = Path(output_path).expanduser()
         else:
             gguf_dest = dest_dir / f"{safe_name}.gguf"
 
-        print(f"[*] Extracting GGUF blob ({round(blob_file.stat().st_size / (1024**3), 2)} GB) -> {gguf_dest}")
-        shutil.copy2(blob_file, gguf_dest)
-        # Update Modelfile FROM to point to local GGUF for portability
+        print(f"[*] Extracting GGUF blob ({round(single_gguf_blob.stat().st_size / (1024**3), 2)} GB) -> {gguf_dest}")
+        shutil.copy2(single_gguf_blob, gguf_dest)
         if (dest_dir / "Modelfile").exists():
             mf_lines = (dest_dir / "Modelfile").read_text(encoding="utf-8").splitlines()
             new_mf = [f"FROM ./{gguf_dest.name}" if l.startswith("FROM ") else l for l in mf_lines]
             (dest_dir / "Modelfile").write_text("\n".join(new_mf) + "\n", encoding="utf-8")
         print(f"[+] Exported GGUF to: {gguf_dest}")
-    else:
+    elif manifest and layers:
+        blobs_dir = OLLAMA_MODELS_DIR / "blobs"
         if to_lmstudio:
             print("[-] Note: This Ollama model uses split safetensors/MLX layers; exporting self-contained bundle instead of single GGUF.")
         print(f"[*] Exporting Ollama bundle ({len(layers)} layers) -> {dest_dir}")
@@ -356,10 +416,12 @@ def export_ollama_model(
             src_blob = blobs_dir / digest
             if src_blob.exists():
                 shutil.copy2(src_blob, out_blobs / digest)
-                # Also extract readable JSON files (config.json, tokenizer.json, etc.)
                 if l.get("mediaType") == "application/vnd.ollama.image.json" and l.get("name"):
                     shutil.copy2(src_blob, dest_dir / l["name"])
         print(f"[+] Exported Ollama bundle to: {dest_dir}")
+    else:
+        print(f"[-] Could not resolve exportable weights for '{model_name}'.", file=sys.stderr)
+        return False
 
     if move:
         print(f"[*] --move enabled: removing '{model_name}' from Ollama registry...")
