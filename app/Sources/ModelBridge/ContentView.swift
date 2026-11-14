@@ -337,8 +337,13 @@ struct ContentView: View {
                             Text("Output Dir")
                                 .frame(width: 100, alignment: .trailing)
                                 .foregroundStyle(.secondary)
-                            TextField("Default: <source>-mlx-<bits>bit", text: $state.customOutputPath)
-                                .textFieldStyle(.roundedBorder)
+                            HStack(spacing: 8) {
+                                TextField("Default: <source>-mlx-<bits>bit", text: $state.customOutputPath)
+                                    .textFieldStyle(.roundedBorder)
+                                Button("Choose…") {
+                                    pickOutputFolder()
+                                }
+                            }
                         }
                     }
                 case .gguf:
@@ -357,11 +362,43 @@ struct ContentView: View {
                             .labelsHidden()
                         }
                         GridRow {
-                            Text("Output File")
+                            Text("Output Dir / File")
                                 .frame(width: 100, alignment: .trailing)
                                 .foregroundStyle(.secondary)
-                            TextField("Default: <source>_<QUANT>.gguf", text: $state.customOutputPath)
-                                .textFieldStyle(.roundedBorder)
+                            HStack(spacing: 8) {
+                                TextField("Default: <source>_<QUANT>.gguf", text: $state.customOutputPath)
+                                    .textFieldStyle(.roundedBorder)
+                                Button("Choose…") {
+                                    pickOutputFolder()
+                                }
+                            }
+                        }
+                    }
+                case .safetensors:
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+                        GridRow {
+                            Text("Precision")
+                                .frame(width: 100, alignment: .trailing)
+                                .foregroundStyle(.secondary)
+                            Picker("Dtype", selection: $state.safetensorsDtype) {
+                                Text("BF16").tag("bfloat16")
+                                Text("FP16").tag("float16")
+                                Text("FP32").tag("float32")
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                        }
+                        GridRow {
+                            Text("Output Dir")
+                                .frame(width: 100, alignment: .trailing)
+                                .foregroundStyle(.secondary)
+                            HStack(spacing: 8) {
+                                TextField("Default: ~/ModelExports/<name>-safetensors", text: $state.customOutputPath)
+                                    .textFieldStyle(.roundedBorder)
+                                Button("Choose…") {
+                                    pickOutputFolder()
+                                }
+                            }
                         }
                     }
                 case .onnx:
@@ -370,8 +407,13 @@ struct ContentView: View {
                             Text("Output Dir")
                                 .frame(width: 100, alignment: .trailing)
                                 .foregroundStyle(.secondary)
-                            TextField("Default: <source>-ONNX-q4f16", text: $state.customOutputPath)
-                                .textFieldStyle(.roundedBorder)
+                            HStack(spacing: 8) {
+                                TextField("Default: <source>-ONNX-q4f16", text: $state.customOutputPath)
+                                    .textFieldStyle(.roundedBorder)
+                                Button("Choose…") {
+                                    pickOutputFolder()
+                                }
+                            }
                         }
                     }
                 case .lmstudio:
@@ -544,6 +586,18 @@ struct ContentView: View {
         panel.message = "Select an Archive / Backup folder (e.g. on an external drive)"
         if panel.runModal() == .OK, let url = panel.url {
             state.archiveDir = url.path
+        }
+    }
+
+    private func pickOutputFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.message = "Select an output directory"
+        if panel.runModal() == .OK, let url = panel.url {
+            state.customOutputPath = url.path
         }
     }
 

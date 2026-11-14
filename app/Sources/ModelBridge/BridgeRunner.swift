@@ -32,6 +32,7 @@ final class BridgeState {
     }
     var mlxBits: Int = 4
     var ggufQuant: String = "Q4_K_M"
+    var safetensorsDtype: String = "bfloat16"
     var customOutputPath: String = ""
 
     var status: ConversionStatus = .idle
@@ -69,7 +70,7 @@ final class BridgeState {
         guard let fmt = inspectedModel?.format else { return nil }
         if sourcePath.hasPrefix("ollama:") {
             if targetFormat == .ollama || targetFormat == .mlx || targetFormat == .onnx {
-                return "To export an Ollama model, select GGUF, LM Studio, or Archive."
+                return "To export an Ollama model, select Safetensors, GGUF, LM Studio, or Archive."
             }
             if targetFormat == .lmstudio && inspectedModel?.has_single_gguf == false {
                 return "This Ollama model uses split MLX/Safetensors layers. Exporting will create a portable bundle rather than a single GGUF."
@@ -77,10 +78,10 @@ final class BridgeState {
             return nil
         }
         if fmt == "GGUF" && (targetFormat == .mlx || targetFormat == .onnx) {
-            return "Quantized GGUF → \(targetFormat.displayName) is lossy/unsupported. Select a Hugging Face Safetensors directory instead."
+            return "Export to Safetensors first (supported for BF16/F16/Q8 GGUF), or use a Hugging Face Safetensors folder."
         }
-        if fmt == "MLX" && (targetFormat == .gguf || targetFormat == .onnx) {
-            return "MLX weights are already Apple Silicon quantized. Use an unquantized Hugging Face Safetensors folder for \(targetFormat.displayName) export."
+        if fmt == "MLX" && targetFormat == .gguf {
+            return "MLX weights are already quantized. Export to Safetensors first, or use an unquantized Hugging Face Safetensors folder."
         }
         return nil
     }
@@ -195,6 +196,11 @@ final class BridgeState {
                 }
                 if sourcePath.hasPrefix("ollama:") && moveToArchive {
                     args.append("--move")
+                }
+            case .safetensors:
+                args.append(contentsOf: ["--dtype", safetensorsDtype])
+                if !customOutputPath.trimmingCharacters(in: .whitespaces).isEmpty {
+                    args.append(contentsOf: ["--output", customOutputPath.trimmingCharacters(in: .whitespaces)])
                 }
             case .onnx:
                 if !customOutputPath.trimmingCharacters(in: .whitespaces).isEmpty {

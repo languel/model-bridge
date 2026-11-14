@@ -763,11 +763,197 @@ def quantize_gguf(source: str, target_quant: str = "Q4_K_M", output_file: Option
         return False
 
 
-def convert_to_onnx(source: str, output_dir: Optional[str] = None) -> bool:
-    """Exports HuggingFace model to ONNX causal LM (q4f16 format) for WebGPU/Transformers.js."""
+def convert_to_safetensors(source: str, output_dir: Optional[str] = None, dtype: str = "bfloat16") -> bool:
+    """Exports MLX, F16/BF16/Q8_0 GGUF, or Ollama GGUF to Hugging Face Safetensors."""
     info = inspect_model(source)
-    if info.get("format") != "HuggingFace Safetensors":
-        print(f"[-] ONNX WebGPU export requires HuggingFace safetensors source (got {info.get('format')}).", file=sys.stderr)
+    if "error" in info:
+        print(f"[-] Error inspecting source: {info['error']}", file=sys.stderr)
+        return False
+
+    fmt = info.get("format", "")
+    src_path_str = info.get("path")
+    if not src_path_str:
+        print(f"[-] Cannot resolve file path for source '{source}'.", file=sys.stderr)
+        return False
+
+    src_path = Path(src_path_str)
+    if not output_dir:
+        base_name = (info.get("name") or src_path.stem).replace(":", "-").replace("/", "_")
+        output_dir = str(Path.home() / "ModelExports" / f"{base_name}-safetensors")
+
+    out_p = Path(output_dir).expanduser()
+    out_p.mkdir(parents=True, exist_ok=True)
+
+    # 1. MLX -> Safetensors via `mlx_lm.convert --dequantize`
+    if fmt == "MLX":
+        mlx_convert_bin = shutil.which("mlx_lm.convert") or "/opt/homebrew/bin/mlx_lm.convert"
+        if not Path(mlx_convert_bin).exists():
+            print(f"[-] mlx_lm.convert not found at '{mlx_convert_bin}'.", file=sys.stderr)
+            return False
+
+        # mlx_lm.convert expects destination not to exist or overwrites inside it
+        if out_p.exists() and not any(out_p.iterdir()):
+            out_p.rmdir()
+
+        print(f"[*] Dequantizing MLX -> Hugging Face Safetensors ({dtype}) at '{out_p}'...")
+        cmd = [
+            mlx_convert_bin,
+            "--hf-path", str(src_path),
+            "--mlx-path", str(out_p),
+            "--dequantize",
+            "--dtype", dtype,
+        ]
+        try:
+            subprocess.run(cmd, check=True)
+            print(f"[+] Successfully exported Safetensors to '{out_p}'!")
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"[-] MLX dequantize failed: {e}", file=sys.stderr)
+            return False
+
+    # 2. HuggingFace Safetensors -> copy
+    if fmt == "HuggingFace Safetensors":
+        print(f"[*] Copying HuggingFace Safetensors -> '{out_p}'...")
+        shutil.copytree(src_path, out_p, dirs_exist_ok=True)
+        print(f"[+] Copied Safetensors to '{out_p}'!")
+        return True
+
+    # 3. GGUF / Ollama (GGUF) -> Safetensors (supports F32, F16, BF16, Q8_0)
+    if fmt in ("GGUF", "Ollama (GGUF)") and src_path.is_file():
+        mlx_py = "/opt/homebrew/Cellar/mlx-lm/0.31.3_2/libexec/bin/python"
+        py_exec = mlx_py if Path(mlx_py).exists() else sys.executable
+        print(f"[*] Extracting GGUF tensors -> Safetensors at '{out_p}'...")
+
+        helper_code = r'''
+import json, struct, sys
+from pathlib import Path
+import numpy as np
+from safetensors.numpy import save_file
+
+gguf_path = Path(sys.argv[1])
+out_dir = Path(sys.argv[2])
+out_dir.mkdir(parents=True, exist_ok=True)
+
+GGUF_SCALAR_SIZES = {0:1, 1:1, 2:2, 3:2, 4:4, 5:4, 6:4, 7:1, 10:8, 11:8, 12:8}
+TYPE_INFO = {
+    0: ("F32", 4, 1),
+    1: ("F16", 2, 1),
+    8: ("Q8_0", 34, 32),
+    30: ("BF16", 2, 1),
+}
+
+with open(gguf_path, "rb") as f:
+    header = f.read(24)
+    magic, version, n_tensors, n_kv = struct.unpack("<4sIQQ", header)
+    assert magic == b"GGUF", "Not a GGUF file"
+    buf = f.read(1024 * 1024 * 32)  # up to 32MB header
+
+pos = 0
+alignment = 32
+kv_meta = {}
+
+def read_str(p):
+    (ln,) = struct.unpack_from("<Q", buf, p)
+    return buf[p+8:p+8+ln].decode("utf-8", errors="replace"), p+8+ln
+
+def read_val(p, vtype):
+    if vtype == 8:
+        return read_str(p)
+    if vtype == 9:
+        atype, alen = struct.unpack_from("<IQ", buf, p)
+        p += 12
+        if atype in GGUF_SCALAR_SIZES:
+            return None, p + alen * GGUF_SCALAR_SIZES[atype]
+        for _ in range(alen):
+            _, p = read_val(p, atype)
+        return None, p
+    fmt_map = {4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+    if vtype in fmt_map:
+        val = struct.unpack_from(fmt_map[vtype], buf, p)[0]
+        return val, p + GGUF_SCALAR_SIZES[vtype]
+    return None, p + GGUF_SCALAR_SIZES[vtype]
+
+for _ in range(n_kv):
+    k, pos = read_str(pos)
+    (vtype,) = struct.unpack_from("<I", buf, pos)
+    pos += 4
+    val, pos = read_val(pos, vtype)
+    if k == "general.alignment" and isinstance(val, int):
+        alignment = val
+    if val is not None and not k.startswith("tokenizer."):
+        kv_meta[k] = val
+
+tensors_meta = []
+for _ in range(n_tensors):
+    tname, pos = read_str(pos)
+    (ndims,) = struct.unpack_from("<I", buf, pos)
+    pos += 4
+    dims = list(struct.unpack_from(f"<{ndims}Q", buf, pos))
+    pos += 8 * ndims
+    ggml_type, rel_offset = struct.unpack_from("<IQ", buf, pos)
+    pos += 12
+    tensors_meta.append((tname, dims, ggml_type, rel_offset))
+
+data_offset = 24 + ((pos + alignment - 1) // alignment * alignment)
+
+unsupported = set(t[2] for t in tensors_meta if t[2] not in TYPE_INFO)
+if unsupported:
+    print(f"ERROR: Unsupported quantized GGUF tensor types {unsupported}. Only F32, F16, BF16, and Q8_0 can be exported cleanly to Safetensors.", file=sys.stderr)
+    sys.exit(2)
+
+out_tensors = {}
+with open(gguf_path, "rb") as f:
+    for tname, dims, gtype, rel_offset in tensors_meta:
+        shape = tuple(reversed(dims))
+        numel = int(np.prod(shape))
+        f.seek(data_offset + rel_offset)
+        t_label, bsize, bcount = TYPE_INFO[gtype]
+        nbytes = (numel // bcount) * bsize
+        raw = f.read(nbytes)
+        if gtype == 0:
+            arr = np.frombuffer(raw, dtype="<f4").reshape(shape)
+        elif gtype == 1:
+            arr = np.frombuffer(raw, dtype="<f2").reshape(shape)
+        elif gtype == 30:
+            u16 = np.frombuffer(raw, dtype="<u2").astype(np.uint32) << 16
+            arr = u16.view(np.float32).astype(np.float16).reshape(shape)
+        elif gtype == 8:
+            qdtype = np.dtype([("d", "<f2"), ("qs", "i1", (32,))])
+            blocks = np.frombuffer(raw, dtype=qdtype)
+            arr = (blocks["qs"].astype(np.float32) * blocks["d"][:, None].astype(np.float32)).astype(np.float16).reshape(shape)
+        out_tensors[tname] = np.ascontiguousarray(arr)
+
+save_file(out_tensors, str(out_dir / "model.safetensors"))
+(out_dir / "gguf_metadata.json").write_text(json.dumps(kv_meta, indent=2))
+print(f"Saved {len(out_tensors)} tensors to {out_dir / 'model.safetensors'}")
+'''
+        res = subprocess.run([py_exec, "-c", helper_code, str(src_path), str(out_p)])
+        if res.returncode == 0:
+            print(f"[+] Successfully exported Safetensors to '{out_p}'!")
+            return True
+        return False
+
+    print(f"[-] Safetensors export from '{fmt}' is not supported.", file=sys.stderr)
+    return False
+
+
+def convert_to_onnx(source: str, output_dir: Optional[str] = None) -> bool:
+    """Exports HuggingFace Safetensors (or MLX via auto-dequantize) to ONNX causal LM (q4f16 format)."""
+    info = inspect_model(source)
+    fmt = info.get("format", "")
+    temp_hf_dir: Optional[Path] = None
+
+    if fmt == "MLX":
+        src_path = Path(info["path"])
+        temp_hf_dir = Path(f"/tmp/hf_dequant_{src_path.name}")
+        print(f"[*] Source is MLX. Auto-dequantizing to temporary Safetensors at '{temp_hf_dir}' first...")
+        if not convert_to_safetensors(source, output_dir=str(temp_hf_dir), dtype="float16"):
+            return False
+        info = inspect_model(str(temp_hf_dir))
+        fmt = info.get("format", "")
+
+    if fmt != "HuggingFace Safetensors":
+        print(f"[-] ONNX WebGPU export requires HuggingFace Safetensors or MLX source (got {fmt}).", file=sys.stderr)
         return False
 
     src_path = Path(info["path"])
@@ -775,22 +961,30 @@ def convert_to_onnx(source: str, output_dir: Optional[str] = None) -> bool:
 
     if not output_dir:
         output_dir = str(src_path.parent / f"{src_path.name}-ONNX-q4f16")
-    out_p = Path(output_dir)
+    out_p = Path(output_dir).expanduser()
 
     print(f"[*] Exporting HuggingFace ({model_type}) -> WebGPU ONNX q4f16 format at '{out_p}'")
 
-    # Check if we have dedicated export scripts in threecoder/scripts
     script_dir = Path(__file__).resolve().parent
-    if "lfm" in model_type or "liquid" in str(src_path).lower():
-        export_script = script_dir / "export_lfm3_onnx_q4f16.py"
-    elif "qwen" in model_type or "qwen" in str(src_path).lower():
-        export_script = script_dir / "export_qwen35_onnx_q4f16.py"
-    else:
-        export_script = None
+    threecoder_scripts = Path.home() / "dev" / "threecoder" / "scripts"
+    search_dirs = [script_dir, threecoder_scripts]
 
-    if export_script and export_script.exists():
+    export_name = None
+    if "lfm" in model_type or "liquid" in str(src_path).lower():
+        export_name = "export_lfm3_onnx_q4f16.py"
+    elif "qwen" in model_type or "qwen" in str(src_path).lower():
+        export_name = "export_qwen35_onnx_q4f16.py"
+
+    export_script = None
+    if export_name:
+        for d in search_dirs:
+            if (d / export_name).exists():
+                export_script = d / export_name
+                break
+
+    if export_script:
         cmd = [sys.executable, str(export_script), "--model-dir", str(src_path), "--output-dir", str(out_p)]
-        print(f"[*] Running architecture-specific WebGPU exporter: {export_script.name}")
+        print(f"[*] Running architecture-specific WebGPU exporter: {export_script}")
         try:
             subprocess.run(cmd, check=True)
             print(f"[+] Successfully exported WebGPU ONNX model to '{out_p}'!")
@@ -798,8 +992,18 @@ def convert_to_onnx(source: str, output_dir: Optional[str] = None) -> bool:
         except subprocess.CalledProcessError as e:
             print(f"[-] ONNX export failed: {e}", file=sys.stderr)
             return False
+    elif shutil.which("optimum-cli"):
+        cmd = ["optimum-cli", "export", "onnx", "--model", str(src_path), "--task", "text-generation-with-past", str(out_p)]
+        print(f"[*] Running optimum-cli universal ONNX exporter...")
+        try:
+            subprocess.run(cmd, check=True)
+            print(f"[+] Successfully exported ONNX model to '{out_p}'!")
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"[-] optimum-cli export failed: {e}", file=sys.stderr)
+            return False
     else:
-        print(f"[-] Universal ONNX exporter: use optimum-cli or vendor exporter for architecture '{model_type}'.", file=sys.stderr)
+        print(f"[-] No ONNX exporter found for architecture '{model_type}' (install optimum or provide an exporter script).", file=sys.stderr)
         return False
 
 
@@ -852,9 +1056,10 @@ Examples:
     # Convert
     convert_parser = subparsers.add_parser("convert", help="Convert model between formats")
     convert_parser.add_argument("source", help="Source model file, HF directory, LM Studio ID, or 'ollama:<name>'")
-    convert_parser.add_argument("--to", required=True, choices=["ollama", "mlx", "onnx", "gguf", "lmstudio"], help="Target format")
+    convert_parser.add_argument("--to", required=True, choices=["ollama", "mlx", "onnx", "gguf", "safetensors", "lmstudio"], help="Target format")
     convert_parser.add_argument("--name", help="Model name for Ollama")
     convert_parser.add_argument("--bits", type=int, default=4, choices=[4, 8, 16], help="Quantization bits for MLX (default: 4)")
+    convert_parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"], help="Target dtype for Safetensors export")
     convert_parser.add_argument("--quant", default="Q4_K_M", help="Target quantization for GGUF (e.g. Q4_K_M, Q8_0)")
     convert_parser.add_argument("--output", help="Output path/directory")
     convert_parser.add_argument("--system", help="System prompt to embed (for Ollama)")
@@ -932,8 +1137,10 @@ Examples:
                 ok = export_ollama_model(ol_name, to_lmstudio=True, move=args.move)
             elif args.to == "gguf":
                 ok = export_ollama_model(ol_name, output_path=args.output, to_lmstudio=False, move=args.move)
+            elif args.to == "safetensors":
+                ok = convert_to_safetensors(args.source, output_dir=args.output, dtype=args.dtype)
             else:
-                print(f"[-] Direct Ollama -> {args.to} conversion is not supported. Export to GGUF or Archive first.", file=sys.stderr)
+                print(f"[-] Direct Ollama -> {args.to} conversion is not supported. Export to Safetensors, GGUF, or Archive first.", file=sys.stderr)
         elif args.to == "ollama":
             caps = [c.strip() for c in args.capabilities.split(",")] if args.capabilities else None
             ok = convert_to_ollama(
@@ -951,6 +1158,8 @@ Examples:
             ok = convert_to_mlx(args.source, output_dir=args.output, q_bits=args.bits)
         elif args.to == "gguf":
             ok = quantize_gguf(args.source, target_quant=args.quant, output_file=args.output)
+        elif args.to == "safetensors":
+            ok = convert_to_safetensors(args.source, output_dir=args.output, dtype=args.dtype)
         elif args.to == "onnx":
             ok = convert_to_onnx(args.source, output_dir=args.output)
         elif args.to == "lmstudio":
