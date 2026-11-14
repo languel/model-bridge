@@ -706,6 +706,55 @@ def infer_ollama_card_defaults(info: Dict[str, Any]) -> Dict[str, Any]:
     return defaults
 
 
+def _strip_ollama_manifest_renderer(model_name: str) -> None:
+    """Strips Ollama's auto-injected renderer/parser/stop when a custom TEMPLATE is used without RENDERER."""
+    import hashlib
+    base, _, tag = model_name.partition(":")
+    if not tag:
+        tag = "latest"
+    root = Path.home() / ".ollama" / "models"
+    candidates = [
+        root / "manifests-v2" / "ollama.com" / "library" / base / tag,
+        root / "manifests" / "registry.ollama.ai" / "library" / base / tag,
+    ]
+    for mf_link in candidates:
+        if not mf_link.exists():
+            continue
+        try:
+            mf = json.loads(mf_link.read_text(encoding="utf-8"))
+            cfg_path = root / "blobs" / mf["config"]["digest"].replace(":", "-")
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            cfg.pop("renderer", None)
+            cfg.pop("parser", None)
+            new_cfg_bytes = json.dumps(cfg, separators=(",", ":")).encode("utf-8")
+            new_cfg_hash = hashlib.sha256(new_cfg_bytes).hexdigest()
+            (root / "blobs" / f"sha256-{new_cfg_hash}").write_bytes(new_cfg_bytes)
+            mf["config"]["digest"] = f"sha256:{new_cfg_hash}"
+            mf["config"]["size"] = len(new_cfg_bytes)
+
+            for layer in mf.get("layers", []):
+                if layer.get("mediaType") == "application/vnd.ollama.image.params":
+                    p_path = root / "blobs" / layer["digest"].replace(":", "-")
+                    p = json.loads(p_path.read_text(encoding="utf-8"))
+                    p.pop("stop", None)
+                    new_p_bytes = json.dumps(p, separators=(",", ":")).encode("utf-8")
+                    new_p_hash = hashlib.sha256(new_p_bytes).hexdigest()
+                    (root / "blobs" / f"sha256-{new_p_hash}").write_bytes(new_p_bytes)
+                    layer["digest"] = f"sha256:{new_p_hash}"
+                    layer["size"] = len(new_p_bytes)
+
+            new_mf_bytes = json.dumps(mf, separators=(",", ":")).encode("utf-8")
+            new_mf_hash = hashlib.sha256(new_mf_bytes).hexdigest()
+            (root / "blobs" / f"sha256-{new_mf_hash}").write_bytes(new_mf_bytes)
+            if mf_link.is_symlink():
+                mf_link.unlink(missing_ok=True)
+                os.symlink(f"../../../../blobs/sha256-{new_mf_hash}", mf_link)
+            else:
+                mf_link.write_bytes(new_mf_bytes)
+        except Exception:
+            pass
+
+
 def build_modelfile(
     src_path: Path,
     info: Dict[str, Any],
@@ -844,6 +893,8 @@ def convert_to_ollama(
             cmd.extend(["-q", q_val])
         print(f"[*] Executing: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
+        if 'TEMPLATE """' in modelfile_content and "\nRENDERER " not in modelfile_content:
+            _strip_ollama_manifest_renderer(model_name)
         print(f"[+] Successfully registered '{model_name}' in Ollama!")
 
         if move_source:
