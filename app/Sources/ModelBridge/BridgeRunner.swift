@@ -34,10 +34,12 @@ final class BridgeState {
     var ggufQuant: String = "Q4_K_M"
     var safetensorsDtype: String = "bfloat16"
     var onnxQuant: String = "q4f16"
+    var lmsTargetFormat: String = "mlx"
     var customOutputPath: String = ""
 
     var status: ConversionStatus = .idle
     var logOutput: String = ""
+    var inspectedRawJSON: String = ""
     var progressFraction: Double? = nil
     var progressMessage: String = ""
     var isRefreshing: Bool = false
@@ -74,10 +76,7 @@ final class BridgeState {
     var compatibilityWarning: String? {
         guard let fmt = inspectedModel?.format else { return nil }
         if sourcePath.hasPrefix("ollama:") {
-            if targetFormat == .ollama {
-                return "Source is already in Ollama. Select Ollama MLX to convert to MLX, or export to Safetensors, GGUF, ONNX, LM Studio, or Archive."
-            }
-            if targetFormat == .lmstudio && inspectedModel?.has_single_gguf == false {
+            if targetFormat == .lmstudio && lmsTargetFormat == "auto" && inspectedModel?.has_single_gguf == false {
                 return "This Ollama model uses split MLX/Safetensors layers. Exporting will create a portable bundle rather than a single GGUF."
             }
             return nil
@@ -103,18 +102,13 @@ final class BridgeState {
     func selectSource(_ path: String) {
         self.sourcePath = path
         if path.hasPrefix("ollama:") {
-            if targetFormat == .ollama {
-                targetFormat = .ollamaMLX
-            }
+            self.ollamaModelName = String(path.dropFirst("ollama:".count))
         } else {
             let base = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
                 .lowercased()
                 .replacingOccurrences(of: "_", with: "-")
                 .replacingOccurrences(of: " ", with: "-")
             self.ollamaModelName = base
-            if targetFormat == .lmstudio {
-                targetFormat = .ollama
-            }
         }
         Task {
             await inspectSource(path)
@@ -143,6 +137,7 @@ final class BridgeState {
         }
 
         do {
+            self.inspectedRawJSON = String(data: data, encoding: .utf8) ?? ""
             let result = try JSONDecoder().decode(InspectedModel.self, from: data)
             self.inspectedModel = result
 
@@ -241,6 +236,17 @@ final class BridgeState {
                     args.append(contentsOf: ["--output", customOutputPath.trimmingCharacters(in: .whitespaces)])
                 }
             case .lmstudio:
+                args.append(contentsOf: ["--lms-format", lmsTargetFormat])
+                if lmsTargetFormat == "mlx" {
+                    args.append(contentsOf: ["--bits", String(mlxBits)])
+                } else if lmsTargetFormat == "gguf" {
+                    args.append(contentsOf: ["--quant", ggufQuant])
+                } else if lmsTargetFormat == "safetensors" {
+                    args.append(contentsOf: ["--dtype", safetensorsDtype])
+                }
+                if !customOutputPath.trimmingCharacters(in: .whitespaces).isEmpty {
+                    args.append(contentsOf: ["--output", customOutputPath.trimmingCharacters(in: .whitespaces)])
+                }
                 if moveToArchive {
                     args.append("--move")
                 }
@@ -257,6 +263,56 @@ final class BridgeState {
         var args = [cliScriptPath, "download", repoId]
         if toLMStudio {
             args.append("--to-lmstudio")
+        }
+        runStreaming(args: args)
+    }
+
+    func fetchModelCard(for source: String) async -> EditableModelCard? {
+        let (data, _) = await runCaptureWithErr(args: ["get-card", source])
+        guard let data else { return nil }
+        return try? JSONDecoder().decode(EditableModelCard.self, from: data)
+    }
+
+    func saveModelCard(
+        source: String,
+        name: String?,
+        renderer: String?,
+        parser: String?,
+        capabilities: String?,
+        numCtx: Int?,
+        temperature: Double?,
+        topP: Double?,
+        topK: Int?,
+        systemPrompt: String?
+    ) {
+        guard status != .running else { return }
+        var args = [cliScriptPath, "edit-card", source]
+        if let name, !name.trimmingCharacters(in: .whitespaces).isEmpty {
+            args.append(contentsOf: ["--name", name.trimmingCharacters(in: .whitespaces)])
+        }
+        if let renderer, !renderer.trimmingCharacters(in: .whitespaces).isEmpty {
+            args.append(contentsOf: ["--renderer", renderer.trimmingCharacters(in: .whitespaces)])
+        }
+        if let parser, !parser.trimmingCharacters(in: .whitespaces).isEmpty {
+            args.append(contentsOf: ["--parser", parser.trimmingCharacters(in: .whitespaces)])
+        }
+        if let capabilities, !capabilities.trimmingCharacters(in: .whitespaces).isEmpty {
+            args.append(contentsOf: ["--capabilities", capabilities.trimmingCharacters(in: .whitespaces)])
+        }
+        if let numCtx {
+            args.append(contentsOf: ["--ctx", String(numCtx)])
+        }
+        if let temperature {
+            args.append(contentsOf: ["--temp", String(temperature)])
+        }
+        if let topP {
+            args.append(contentsOf: ["--top-p", String(topP)])
+        }
+        if let topK {
+            args.append(contentsOf: ["--top-k", String(topK)])
+        }
+        if let systemPrompt {
+            args.append(contentsOf: ["--system", systemPrompt])
         }
         runStreaming(args: args)
     }

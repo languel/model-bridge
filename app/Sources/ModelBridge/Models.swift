@@ -33,7 +33,7 @@ enum TargetFormat: String, CaseIterable, Identifiable {
         case .gguf: return "Quantize GGUF via llama-quantize, or extract GGUF from Ollama"
         case .safetensors: return "Export MLX or BF16/F16/Q8 GGUF to Hugging Face Safetensors"
         case .onnx: return "Browser WebGPU causal LM (q4f16) — chains HF, Safetensors, MLX, GGUF, or Ollama"
-        case .lmstudio: return "Export Ollama model directly into LM Studio (~/.lmstudio/models)"
+        case .lmstudio: return "Convert/import any source (HF Hub, Safetensors, GGUF, Ollama) into LM Studio (~/.lmstudio/models)"
         case .archive: return "Copy or move model (with Modelfile/weights) to a backup or external drive"
         }
     }
@@ -80,4 +80,20 @@ struct InspectedModel: Codable, Hashable {
     let has_single_gguf: Bool?
     let quantization: QuantizationInfo?
     let error: String?
+}
+
+struct EditableModelCard: Codable {
+    var kind: String?
+    var name: String?
+    var path: String?
+    var renderer: String?
+    var parser: String?
+    var capabilities: String?
+    var num_ctx: Int?
+    var temperature: Double?
+    var top_p: Double?
+    var top_k: Int?
+    var system: String?
+    var modelfile: String?
+    var error: String?
 }

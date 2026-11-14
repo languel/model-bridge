@@ -8,6 +8,9 @@ struct ContentView: View {
     @State private var isDropTargeted = false
     @State private var pendingDeleteOllama: String?
     @State private var pendingDeleteLMStudio: LMStudioModel?
+    @State private var showingInspectSheet = false
+    @State private var showingCardEditor = false
+    @State private var editingCard = EditableModelCard()
 
     var body: some View {
         Group {
@@ -85,6 +88,33 @@ struct ContentView: View {
             }
         } message: {
             Text("This will permanently delete '\(pendingDeleteLMStudio?.displayName ?? "")' from disk.")
+        }
+        .sheet(isPresented: $showingInspectSheet) {
+            InspectModelSheet(
+                sourcePath: state.sourcePath,
+                rawJSON: state.inspectedRawJSON,
+                info: state.inspectedModel
+            )
+        }
+        .sheet(isPresented: $showingCardEditor) {
+            ModelCardEditorSheet(
+                sourcePath: state.sourcePath,
+                card: $editingCard,
+                onSave: { updated in
+                    state.saveModelCard(
+                        source: state.sourcePath,
+                        name: updated.name,
+                        renderer: updated.renderer,
+                        parser: updated.parser,
+                        capabilities: updated.capabilities,
+                        numCtx: updated.num_ctx,
+                        temperature: updated.temperature,
+                        topP: updated.top_p,
+                        topK: updated.top_k,
+                        systemPrompt: updated.system
+                    )
+                }
+            )
         }
     }
 
@@ -222,7 +252,10 @@ struct ContentView: View {
                     }
 
                     Button {
-                        state.selectSource(state.sourcePath)
+                        Task {
+                            await state.inspectSource(state.sourcePath)
+                            showingInspectSheet = true
+                        }
                     } label: {
                         if state.isInspecting {
                             ProgressView()
@@ -256,6 +289,22 @@ struct ContentView: View {
                             }
 
                             Spacer()
+
+                            if state.sourcePath.hasPrefix("ollama:") || FileManager.default.fileExists(atPath: state.sourcePath) {
+                                Button {
+                                    Task {
+                                        if let loaded = await state.fetchModelCard(for: state.sourcePath), loaded.error == nil {
+                                            editingCard = loaded
+                                            showingCardEditor = true
+                                        }
+                                    }
+                                } label: {
+                                    Label("Edit Card…", systemImage: "square.and.pencil")
+                                }
+                                .controlSize(.small)
+                                .buttonStyle(.bordered)
+                                .help("Edit Model Card / parameters without converting weights")
+                            }
 
                             if state.sourcePath.hasPrefix("ollama:") {
                                 Button(role: .destructive) {
@@ -494,17 +543,75 @@ struct ContentView: View {
                 case .lmstudio:
                     Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
                         GridRow {
+                            Text("Format")
+                                .frame(width: 100, alignment: .trailing)
+                                .foregroundStyle(.secondary)
+                            Picker("LM Studio Format", selection: $state.lmsTargetFormat) {
+                                Text("MLX").tag("mlx")
+                                Text("Direct / Auto").tag("auto")
+                                Text("GGUF").tag("gguf")
+                                Text("Safetensors").tag("safetensors")
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                        }
+                        if state.lmsTargetFormat == "mlx" {
+                            GridRow {
+                                Text("Precision")
+                                    .frame(width: 100, alignment: .trailing)
+                                    .foregroundStyle(.secondary)
+                                Picker("Bits", selection: $state.mlxBits) {
+                                    Text("4-bit (Fastest)").tag(4)
+                                    Text("8-bit (Balanced)").tag(8)
+                                    Text("16-bit (BF16)").tag(16)
+                                }
+                                .pickerStyle(.segmented)
+                                .labelsHidden()
+                            }
+                        } else if state.lmsTargetFormat == "gguf" {
+                            GridRow {
+                                Text("Quantization")
+                                    .frame(width: 100, alignment: .trailing)
+                                    .foregroundStyle(.secondary)
+                                Picker("Quant", selection: $state.ggufQuant) {
+                                    Text("Q4_K_M").tag("Q4_K_M")
+                                    Text("Q5_K_M").tag("Q5_K_M")
+                                    Text("Q8_0").tag("Q8_0")
+                                    Text("F16").tag("F16")
+                                }
+                                .pickerStyle(.segmented)
+                                .labelsHidden()
+                            }
+                        } else if state.lmsTargetFormat == "safetensors" {
+                            GridRow {
+                                Text("Dtype")
+                                    .frame(width: 100, alignment: .trailing)
+                                    .foregroundStyle(.secondary)
+                                Picker("Dtype", selection: $state.safetensorsDtype) {
+                                    Text("BF16").tag("bfloat16")
+                                    Text("FP16").tag("float16")
+                                    Text("FP32").tag("float32")
+                                }
+                                .pickerStyle(.segmented)
+                                .labelsHidden()
+                            }
+                        }
+                        GridRow {
                             Text("Destination")
                                 .frame(width: 100, alignment: .trailing)
                                 .foregroundStyle(.secondary)
-                            Text("~/.lmstudio/models/ollama-export/")
-                                .font(.system(.callout, design: .monospaced))
-                                .foregroundStyle(.secondary)
+                            HStack(spacing: 8) {
+                                TextField("Default: ~/.lmstudio/models/<owner>/<model>", text: $state.customOutputPath)
+                                    .textFieldStyle(.roundedBorder)
+                                Button("Choose…") {
+                                    pickOutputFolder()
+                                }
+                            }
                         }
                         GridRow {
                             Text("")
                                 .frame(width: 100)
-                            Toggle("Remove from Ollama after exporting to LM Studio", isOn: $state.moveToArchive)
+                            Toggle("Move source (remove original after importing to LM Studio)", isOn: $state.moveToArchive)
                                 .font(.caption)
                         }
                     }

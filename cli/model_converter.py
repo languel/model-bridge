@@ -1337,6 +1337,281 @@ elif q_mode == "int8":
         return False
 
 
+def convert_to_lmstudio(
+    source: str,
+    lms_format: str = "auto",
+    q_bits: int = 4,
+    quant: str = "Q4_K_M",
+    dtype: str = "bfloat16",
+    output_dir: Optional[str] = None,
+    move_source: bool = False,
+) -> bool:
+    """Converts/downloads any source directly into ~/.lmstudio/models/<owner>/<model>."""
+    if source.startswith("ollama:") and lms_format in ("auto", "gguf"):
+        ol_name = source.replace("ollama:", "", 1)
+        return export_ollama_model(ol_name, output_path=output_dir, to_lmstudio=(output_dir is None), move=move_source)
+
+    info = inspect_model(source)
+    if "error" in info:
+        print(f"[-] Error inspecting source: {info['error']}", file=sys.stderr)
+        return False
+
+    fmt = info.get("format", "")
+    # Determine publisher/model folder inside ~/.lmstudio/models
+    if fmt == "HuggingFace Hub":
+        repo_id = info["repo_id"]
+        parts = repo_id.split("/", 1)
+        owner = parts[0] if len(parts) == 2 else "hf-imports"
+        repo_name = parts[1] if len(parts) == 2 else parts[0]
+    else:
+        owner = "local-imports"
+        raw_name = info.get("name") or Path(info.get("path", "model")).stem
+        repo_name = raw_name.replace(":", "-").replace("/", "_")
+
+    if output_dir:
+        dest_dir = Path(output_dir).expanduser()
+    else:
+        suffix = ""
+        if lms_format == "mlx":
+            suffix = f"-mlx-{q_bits}bit" if "mlx" not in repo_name.lower() else ""
+        elif lms_format == "safetensors":
+            suffix = "-safetensors"
+        elif lms_format == "gguf":
+            suffix = f"-gguf-{quant.lower()}"
+        dest_dir = LM_STUDIO_MODELS_DIR / owner / f"{repo_name}{suffix}"
+
+    if lms_format == "auto":
+        if fmt == "HuggingFace Hub":
+            return download_hf_repo(info["repo_id"], output_dir=str(dest_dir), to_lmstudio=False)
+        src_p = Path(info["path"])
+        dest_dir.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[*] Importing {fmt} -> LM Studio at '{dest_dir}'...")
+        if src_p.is_dir():
+            if move_source:
+                shutil.move(str(src_p), str(dest_dir))
+            else:
+                shutil.copytree(src_p, dest_dir, dirs_exist_ok=True)
+        elif src_p.is_file():
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            target_file = dest_dir / src_p.name
+            if move_source:
+                shutil.move(str(src_p), str(target_file))
+            else:
+                shutil.copy2(src_p, target_file)
+        print(f"[+] Imported into LM Studio at '{dest_dir}'!")
+        return True
+
+    if lms_format == "mlx":
+        if fmt == "MLX":
+            src_p = Path(info["path"])
+            dest_dir.parent.mkdir(parents=True, exist_ok=True)
+            print(f"[*] Copying MLX model -> LM Studio at '{dest_dir}'...")
+            if move_source:
+                shutil.move(str(src_p), str(dest_dir))
+            else:
+                shutil.copytree(src_p, dest_dir, dirs_exist_ok=True)
+            print(f"[+] MLX model ready in LM Studio at '{dest_dir}'!")
+            return True
+        ok = convert_to_mlx(source, output_dir=str(dest_dir), q_bits=q_bits)
+        if ok and move_source and not source.startswith(("hf:", "ollama:")):
+            src_p = Path(info["path"])
+            if src_p.is_dir():
+                shutil.rmtree(src_p, ignore_errors=True)
+            elif src_p.is_file():
+                src_p.unlink(missing_ok=True)
+        return ok
+
+    if lms_format == "safetensors":
+        return convert_to_safetensors(source, output_dir=str(dest_dir), dtype=dtype)
+
+    if lms_format == "gguf":
+        if fmt == "GGUF":
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            src_p = Path(info["path"])
+            out_gguf = dest_dir / f"{src_p.stem}_{quant.upper()}.gguf"
+            return quantize_gguf(source, target_quant=quant, output_file=str(out_gguf))
+        print(f"[-] Direct {fmt} -> GGUF for LM Studio requires a GGUF or Ollama source.", file=sys.stderr)
+        return False
+
+    print(f"[-] Unsupported LM Studio format '{lms_format}'.", file=sys.stderr)
+    return False
+
+
+def get_model_card(source: str) -> Dict[str, Any]:
+    """Reads editable Model Card / metadata for Ollama or local LM Studio/HF models."""
+    if source.startswith("ollama:"):
+        ol_name = source.replace("ollama:", "", 1)
+        _, mf_text = get_ollama_modelfile_blob(ol_name)
+        meta = get_ollama_show_metadata(ol_name)
+        caps: List[str] = []
+        renderer = meta.get("renderer", "")
+        parser_name = meta.get("parser", "")
+        system_lines: List[str] = []
+        num_ctx: Optional[int] = None
+        temperature: Optional[float] = None
+        top_p: Optional[float] = None
+        top_k: Optional[int] = None
+
+        in_system = False
+        for line in mf_text.splitlines():
+            stripped = line.strip()
+            if in_system:
+                if stripped.endswith('"""'):
+                    system_lines.append(line[: line.rfind('"""')])
+                    in_system = False
+                else:
+                    system_lines.append(line)
+                continue
+            upper = stripped.upper()
+            if upper.startswith("RENDERER "):
+                renderer = stripped[9:].strip()
+            elif upper.startswith("PARSER "):
+                parser_name = stripped[7:].strip()
+            elif upper.startswith("CAPABILITY "):
+                caps.append(stripped[11:].strip())
+            elif upper.startswith("SYSTEM "):
+                rest = stripped[7:].strip()
+                if rest.startswith('"""'):
+                    inner = rest[3:]
+                    if inner.endswith('"""') and len(inner) >= 3:
+                        system_lines.append(inner[:-3])
+                    else:
+                        system_lines.append(inner)
+                        in_system = True
+                else:
+                    system_lines.append(rest.strip('"'))
+            elif upper.startswith("PARAMETER "):
+                parts = stripped[10:].strip().split(None, 1)
+                if len(parts) == 2:
+                    pk, pv = parts[0].lower(), parts[1].strip()
+                    try:
+                        if pk == "num_ctx":
+                            num_ctx = int(pv)
+                        elif pk == "temperature":
+                            temperature = float(pv)
+                        elif pk == "top_p":
+                            top_p = float(pv)
+                        elif pk == "top_k":
+                            top_k = int(pv)
+                    except ValueError:
+                        pass
+
+        return {
+            "kind": "ollama",
+            "name": ol_name,
+            "renderer": renderer,
+            "parser": parser_name,
+            "capabilities": ", ".join(caps) if caps else "completion",
+            "num_ctx": num_ctx or 32768,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "system": "\n".join(system_lines).strip(),
+            "modelfile": mf_text,
+        }
+
+    p = Path(source).expanduser()
+    if p.is_dir():
+        gen_cfg_path = p / "generation_config.json"
+        gen_cfg: Dict[str, Any] = {}
+        if gen_cfg_path.exists():
+            try:
+                gen_cfg = json.loads(gen_cfg_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {
+            "kind": "local",
+            "name": p.name,
+            "path": str(p),
+            "temperature": gen_cfg.get("temperature"),
+            "top_p": gen_cfg.get("top_p"),
+            "top_k": gen_cfg.get("top_k"),
+            "max_new_tokens": gen_cfg.get("max_new_tokens"),
+        }
+
+    return {"error": "Model Card editing is supported for Ollama models and local model folders."}
+
+
+def edit_model_card(
+    source: str,
+    new_name: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    num_ctx: Optional[int] = None,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+    renderer: Optional[str] = None,
+    parser_name: Optional[str] = None,
+    capabilities: Optional[List[str]] = None,
+) -> bool:
+    """Updates an Ollama Model Card (zero-copy FROM <model>) or local generation_config.json without converting weights."""
+    if source.startswith("ollama:"):
+        ol_name = source.replace("ollama:", "", 1)
+        target_name = (new_name or ol_name).strip()
+
+        lines = [f"FROM {ol_name}"]
+        if renderer:
+            lines.append(f"RENDERER {renderer}")
+        if parser_name:
+            lines.append(f"PARSER {parser_name}")
+        if capabilities:
+            for cap in capabilities:
+                if cap:
+                    lines.append(f"CAPABILITY {cap}")
+        if system_prompt is not None and system_prompt.strip():
+            lines.append(f'SYSTEM """{system_prompt}"""')
+        if num_ctx:
+            lines.append(f"PARAMETER num_ctx {num_ctx}")
+        if temperature is not None:
+            lines.append(f"PARAMETER temperature {temperature}")
+        if top_p is not None:
+            lines.append(f"PARAMETER top_p {top_p}")
+        if top_k is not None:
+            lines.append(f"PARAMETER top_k {top_k}")
+
+        modelfile_content = "\n".join(lines) + "\n"
+        modelfile_path = _register_temp_path(Path(f"/tmp/Modelfile_edit_{target_name.replace(':', '_').replace('/', '_')}"))
+        modelfile_path.write_text(modelfile_content, encoding="utf-8")
+
+        print(f"[*] Updating Ollama Model Card '{target_name}' (zero-copy, no weight conversion):")
+        print("-" * 50)
+        for l in lines:
+            print(f"    {l}")
+        print("-" * 50)
+        try:
+            subprocess.run(["ollama", "create", target_name, "-f", str(modelfile_path)], check=True)
+            print(f"[+] Updated Ollama Model Card for '{target_name}'!")
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"[-] Failed to update Ollama Model Card: {e}", file=sys.stderr)
+            return False
+        finally:
+            if modelfile_path.exists():
+                modelfile_path.unlink(missing_ok=True)
+
+    p = Path(source).expanduser()
+    if p.is_dir():
+        gen_cfg_path = p / "generation_config.json"
+        cfg: Dict[str, Any] = {}
+        if gen_cfg_path.exists():
+            try:
+                cfg = json.loads(gen_cfg_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        if temperature is not None:
+            cfg["temperature"] = temperature
+        if top_p is not None:
+            cfg["top_p"] = top_p
+        if top_k is not None:
+            cfg["top_k"] = top_k
+        gen_cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+        print(f"[+] Updated generation_config.json at '{gen_cfg_path}'!")
+        return True
+
+    print("[-] Card editing is only supported for Ollama models and local model directories.", file=sys.stderr)
+    return False
+
+
 # =====================================================================
 # CLI Entry Point
 # =====================================================================
@@ -1392,6 +1667,7 @@ Examples:
     convert_parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"], help="Target dtype for Safetensors export")
     convert_parser.add_argument("--onnx-quant", default="q4f16", choices=["q4f16", "int4", "int8", "fp16"], help="Target quantization/precision for ONNX export")
     convert_parser.add_argument("--quant", default="Q4_K_M", help="Target quantization for GGUF (e.g. Q4_K_M, Q8_0)")
+    convert_parser.add_argument("--lms-format", default="auto", choices=["auto", "mlx", "gguf", "safetensors"], help="Target sub-format when --to lmstudio")
     convert_parser.add_argument("--output", help="Output path/directory")
     convert_parser.add_argument("--system", help="System prompt to embed (for Ollama)")
     convert_parser.add_argument("--ctx", type=int, help="Context length num_ctx (for Ollama)")
@@ -1427,6 +1703,22 @@ Examples:
     dl_parser.add_argument("repo", help="Hugging Face repo ID (e.g. mlx-community/Qwen3.8-27B-4bit)")
     dl_parser.add_argument("--to-lmstudio", action="store_true", help="Download into ~/.lmstudio/models/<owner>/<repo>")
     dl_parser.add_argument("--output", help="Custom destination directory")
+
+    # Get / Edit Model Card without weight conversion
+    get_card_parser = subparsers.add_parser("get-card", help="Read Model Card / generation_config for Ollama or local model")
+    get_card_parser.add_argument("source", help="'ollama:<name>' or local model folder")
+
+    edit_card_parser = subparsers.add_parser("edit-card", help="Update Ollama Model Card or local generation_config without weight conversion")
+    edit_card_parser.add_argument("source", help="'ollama:<name>' or local model folder")
+    edit_card_parser.add_argument("--name", help="New/target Ollama model name")
+    edit_card_parser.add_argument("--system", help="System prompt")
+    edit_card_parser.add_argument("--ctx", type=int, help="Context length num_ctx")
+    edit_card_parser.add_argument("--temp", type=float, help="Temperature")
+    edit_card_parser.add_argument("--top-p", type=float, help="Top-p")
+    edit_card_parser.add_argument("--top-k", type=int, help="Top-k")
+    edit_card_parser.add_argument("--renderer", help="Ollama RENDERER")
+    edit_card_parser.add_argument("--parser", dest="parser_name", help="Ollama PARSER")
+    edit_card_parser.add_argument("--capabilities", help="Comma-separated Ollama CAPABILITY values")
 
     args = parser.parse_args()
 
@@ -1468,16 +1760,24 @@ Examples:
 
     elif args.command == "convert":
         ok = False
-        if args.source.startswith("ollama:") and args.to in ("lmstudio", "gguf", "safetensors", "ollama"):
-            ol_name = args.source.replace("ollama:", "", 1)
-            if args.to == "lmstudio":
-                ok = export_ollama_model(ol_name, to_lmstudio=True, move=args.move)
-            elif args.to == "gguf":
+        if args.source.startswith("ollama:") and args.to in ("gguf", "safetensors", "ollama"):
+            if args.to == "gguf":
+                ol_name = args.source.replace("ollama:", "", 1)
                 ok = export_ollama_model(ol_name, output_path=args.output, to_lmstudio=False, move=args.move)
             elif args.to == "safetensors":
                 ok = convert_to_safetensors(args.source, output_dir=args.output, dtype=args.dtype)
-            else:
-                print(f"[-] Direct Ollama -> {args.to} conversion is not supported. Use 'ollama-mlx' to convert to Ollama MLX, or export to Safetensors/GGUF.", file=sys.stderr)
+            elif args.to == "ollama":
+                caps = [c.strip() for c in args.capabilities.split(",")] if args.capabilities else None
+                ok = edit_model_card(
+                    args.source,
+                    new_name=args.name,
+                    system_prompt=args.system,
+                    num_ctx=args.ctx,
+                    temperature=args.temp,
+                    renderer=args.renderer,
+                    parser_name=args.parser_name,
+                    capabilities=caps,
+                )
         elif args.to == "ollama":
             caps = [c.strip() for c in args.capabilities.split(",")] if args.capabilities else None
             ok = convert_to_ollama(
@@ -1515,7 +1815,34 @@ Examples:
         elif args.to == "onnx":
             ok = convert_to_onnx(args.source, output_dir=args.output, onnx_quant=args.onnx_quant)
         elif args.to == "lmstudio":
-            print("[-] Local file -> LM Studio: place your GGUF/HF folder in ~/.lmstudio/models/ or use archive/export.", file=sys.stderr)
+            ok = convert_to_lmstudio(
+                args.source,
+                lms_format=args.lms_format,
+                q_bits=args.bits,
+                quant=args.quant,
+                dtype=args.dtype,
+                output_dir=args.output,
+                move_source=args.move,
+            )
+        sys.exit(0 if ok else 1)
+
+    elif args.command == "get-card":
+        print(json.dumps(get_model_card(args.source), indent=2))
+
+    elif args.command == "edit-card":
+        caps = [c.strip() for c in args.capabilities.split(",")] if args.capabilities else None
+        ok = edit_model_card(
+            args.source,
+            new_name=args.name,
+            system_prompt=args.system,
+            num_ctx=args.ctx,
+            temperature=args.temp,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            renderer=args.renderer,
+            parser_name=args.parser_name,
+            capabilities=caps,
+        )
         sys.exit(0 if ok else 1)
 
     elif args.command == "export-ollama":
