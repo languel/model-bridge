@@ -62,6 +62,36 @@ LM_STUDIO_MODELS_DIR = Path.home() / ".lmstudio" / "models"
 GGUF_MAGIC = b"GGUF"
 
 
+def _find_mlx_python() -> str:
+    """Dynamically locates the Python interpreter bundled with Homebrew mlx-lm, falling back to sys.executable."""
+    candidates = [
+        Path("/opt/homebrew/opt/mlx-lm/libexec/bin/python"),
+        Path("/usr/local/opt/mlx-lm/libexec/bin/python"),
+    ]
+    for cand in candidates:
+        if cand.is_file():
+            return str(cand)
+
+    mlx_bin = shutil.which("mlx_lm.convert") or "/opt/homebrew/bin/mlx_lm.convert"
+    if Path(mlx_bin).is_file():
+        try:
+            first_line = Path(mlx_bin).read_text(encoding="utf-8", errors="ignore").splitlines()[0]
+            if first_line.startswith("#!"):
+                py = first_line[2:].strip().split()[0]
+                if Path(py).is_file():
+                    return py
+        except Exception:
+            pass
+
+    for cellar in (Path("/opt/homebrew/Cellar/mlx-lm"), Path("/usr/local/Cellar/mlx-lm")):
+        if cellar.is_dir():
+            matches = sorted(cellar.glob("*/libexec/bin/python"), reverse=True)
+            if matches:
+                return str(matches[0])
+
+    return sys.executable
+
+
 # =====================================================================
 # GGUF Parser (Pure Python, zero-dependency)
 # =====================================================================
@@ -232,8 +262,7 @@ def inspect_hf_hub(repo_id: str) -> Dict[str, Any]:
 def resolve_hf_hub_snapshot(repo_id: str) -> Optional[Path]:
     """Downloads (or resolves cached) Hugging Face repo snapshot or single file via huggingface_hub."""
     clean_id, filename = _split_hf_spec(repo_id)
-    mlx_py = "/opt/homebrew/Cellar/mlx-lm/0.31.3_2/libexec/bin/python"
-    py_exec = mlx_py if Path(mlx_py).exists() else sys.executable
+    py_exec = _find_mlx_python()
     if filename:
         print(f"[*] Resolving Hugging Face file '{clean_id} / {filename}' (downloading/caching)...")
         code = (
@@ -1102,15 +1131,7 @@ def convert_to_mlx(source: str, output_dir: Optional[str] = None, q_bits: int = 
 
     if staged_dir is not None:
         # Run mlx_lm.convert with patched gemma4.Model.sanitize for unified multimodal keys
-        mlx_py = "/opt/homebrew/Cellar/mlx-lm/0.31.3_2/libexec/bin/python"
-        if not Path(mlx_py).exists():
-            # Fallback: read shebang from mlx_lm.convert
-            try:
-                first_line = Path(mlx_convert_bin).read_text(encoding="utf-8", errors="ignore").splitlines()[0]
-                if first_line.startswith("#!"):
-                    mlx_py = first_line[2:].strip().split()[0]
-            except Exception:
-                mlx_py = sys.executable
+        mlx_py = _find_mlx_python()
         wrapper_code = (
             "import sys\n"
             "import mlx_lm.models.gemma4 as g4\n"
@@ -1497,8 +1518,7 @@ def convert_to_safetensors(source: str, output_dir: Optional[str] = None, dtype:
 
     # 3. GGUF / Ollama (GGUF) -> Safetensors (supports F32, F16, BF16, Q8_0)
     if fmt in ("GGUF", "Ollama (GGUF)") and src_path.is_file():
-        mlx_py = "/opt/homebrew/Cellar/mlx-lm/0.31.3_2/libexec/bin/python"
-        py_exec = mlx_py if Path(mlx_py).exists() else sys.executable
+        py_exec = _find_mlx_python()
         print(f"[*] Extracting GGUF tensors -> Safetensors at '{out_p}'...")
 
         helper_code = r'''
@@ -2004,26 +2024,26 @@ def main():
         epilog="""
 Examples:
   # Inspect any model or GGUF
-  ./scripts/model_converter.py inspect /path/to/model.gguf
-  ./scripts/model_converter.py inspect ~/.lmstudio/models/npario/humanizer-12b-mlx-8bit
+  ./bin/model-convert inspect /path/to/model.gguf
+  ./bin/model-convert inspect ~/.lmstudio/models/owner/model-mlx-8bit
 
   # List models downloaded in LM Studio
-  ./scripts/model_converter.py list-lmstudio
+  ./bin/model-convert list-lmstudio
 
   # List registered Ollama models
-  ./scripts/model_converter.py list-ollama
+  ./bin/model-convert list-ollama
 
   # Convert / Register LM Studio GGUF directly into Ollama
-  ./scripts/model_converter.py convert /path/to/model.gguf --to ollama --name my-model
+  ./bin/model-convert convert /path/to/model.gguf --to ollama --name my-model
 
   # Convert HuggingFace model to MLX (4-bit Metal)
-  ./scripts/model_converter.py convert /path/to/hf-model --to mlx --bits 4
+  ./bin/model-convert convert /path/to/hf-model --to mlx --bits 4
 
   # Quantize GGUF (e.g. FP16/Q8 to Q4_K_M)
-  ./scripts/model_converter.py convert /path/to/model.gguf --to gguf --quant Q4_K_M
+  ./bin/model-convert convert /path/to/model.gguf --to gguf --quant Q4_K_M
 
   # Convert HuggingFace model to WebGPU ONNX
-  ./scripts/model_converter.py convert /path/to/hf-model --to onnx
+  ./bin/model-convert convert /path/to/hf-model --to onnx
 """
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
@@ -2278,8 +2298,7 @@ Examples:
         else:
             dest = Path.home() / "ModelExports" / clean_id.replace("/", "_")
         dest.mkdir(parents=True, exist_ok=True)
-        mlx_py = "/opt/homebrew/Cellar/mlx-lm/0.31.3_2/libexec/bin/python"
-        py_exec = mlx_py if Path(mlx_py).exists() else sys.executable
+        py_exec = _find_mlx_python()
         print(f"[*] Downloading '{clean_id}' -> {dest} ...")
         code = (
             "import sys; "

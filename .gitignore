@@ -1,7 +1,48 @@
+# macOS & OS artifacts
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.venv/
+.gguf-venv/
+venv/
+*.egg-info/
+
+# Swift / macOS App build artifacts
 app/.build/
 ModelBridge.app/
-.gguf-venv/
+*.xcarchive
+*.dSYM
+
+# External converter tools (fetched locally, not tracked)
 tools/
+
+# NEVER track model weights, archives, or local registries
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.onnx_data
+*.npz
+*.npy
+*.h5
+*.mlmodel
+*.mlpackage
+*.ollama
+models/
+ModelExports/
+blobs/
+manifests/
+manifests-v2/
+
+# Web / Node (if used locally)
+node_modules/
+web/dist/

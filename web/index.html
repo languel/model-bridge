@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Model Bridge — Browser LLM Inspector, Estimator &amp; Modelfile Studio</title>
+  <meta name="description" content="100% client-side GGUF &amp; Safetensors zero-copy header inspector, Hugging Face explorer, Apple Silicon memory estimator, and Ollama Modelfile builder." />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-icon">MB</div>
+      <span>Model Bridge</span>
+      <span class="brand-pill">100% In-Browser</span>
+    </div>
+
+    <nav class="nav-tabs" role="tablist">
+      <button class="tab-btn active" data-tab="inspect">Inspect Local</button>
+      <button class="tab-btn" data-tab="hf">HF Hub Explorer</button>
+      <button class="tab-btn" data-tab="estimator">Memory Estimator</button>
+      <button class="tab-btn" data-tab="builder">Modelfile &amp; CLI</button>
+      <button class="tab-btn" data-tab="ollama">Local Ollama</button>
+    </nav>
+
+    <div class="top-links">
+      <a href="https://github.com/languel/model-bridge" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/languel/model-bridge/blob/main/docs/cli-reference.md" target="_blank" rel="noopener">Docs</a>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- TAB 1: INSPECT LOCAL -->
+    <section id="tab-inspect" class="panel active">
+      <div class="card">
+        <div id="dropzone" class="dropzone">
+          <h2>Zero-Copy Local Model Inspector</h2>
+          <p>Drop a <code>.gguf</code>, <code>.safetensors</code>, <code>config.json</code>, or model folder. Only headers are read via <code>File.slice()</code> — nothing leaves your browser.</p>
+          <div class="btn-row">
+            <button id="btn-pick-file" class="btn btn-primary" type="button">Choose File (.gguf / .safetensors / config.json)</button>
+            <button id="btn-pick-folder" class="btn" type="button">Choose Model Folder</button>
+          </div>
+          <input id="input-file" type="file" accept=".gguf,.safetensors,.json" class="hidden" />
+          <input id="input-folder" type="file" webkitdirectory directory multiple class="hidden" />
+        </div>
+      </div>
+
+      <div id="inspect-error" class="error-box hidden"></div>
+
+      <div id="inspect-results" class="hidden">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 id="insp-title" class="card-title">Model</h3>
+              <p id="insp-subtitle" class="subtitle"></p>
+            </div>
+            <div class="btn-row">
+              <button id="btn-send-estimator" class="btn btn-sm btn-primary" type="button">Send to Memory Estimator</button>
+              <button id="btn-send-builder" class="btn btn-sm" type="button">Send to Modelfile &amp; CLI</button>
+              <button id="btn-export-json" class="btn btn-sm" type="button">Download JSON</button>
+            </div>
+          </div>
+
+          <div id="insp-metrics" class="metrics-grid"></div>
+          <div id="insp-dtypes" class="chip-row"></div>
+        </div>
+
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Metadata Key-Values</h3>
+              <input id="kv-filter" type="text" placeholder="Filter keys..." style="max-width: 210px;" />
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Key</th><th>Value</th></tr></thead>
+                <tbody id="kv-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3 id="tensor-title" class="card-title">Tensors</h3>
+              <input id="tensor-filter" type="text" placeholder="Filter tensors..." style="max-width: 210px;" />
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Name</th><th>Dtype</th><th>Shape</th></tr></thead>
+                <tbody id="tensor-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div id="chat-template-card" class="card hidden">
+          <div class="card-header">
+            <h3 class="card-title">Embedded Chat Template</h3>
+            <button id="btn-copy-template" class="btn btn-sm" type="button">Copy Template</button>
+          </div>
+          <pre id="chat-template-pre" class="code-box"></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 2: HF HUB EXPLORER -->
+    <section id="tab-hf" class="panel">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Hugging Face Hub Explorer</h3>
+            <p class="subtitle">Search repos or inspect any <code>owner/repo</code> directly from your browser via the public Hugging Face API.</p>
+          </div>
+        </div>
+
+        <div class="search-bar">
+          <input id="hf-query" type="text" placeholder="Search Hugging Face (e.g. mlx-community qwen3, gemma-4, llama-3.3 gguf) or enter owner/repo" />
+          <button id="btn-hf-search" class="btn btn-primary" type="button">Search</button>
+          <button id="btn-hf-inspect" class="btn" type="button">Inspect Repo ID</button>
+        </div>
+
+        <div class="chip-row">
+          <button class="chip hf-preset" data-q="mlx-community">mlx-community</button>
+          <button class="chip hf-preset" data-q="gguf qwen3">GGUF Qwen3</button>
+          <button class="chip hf-preset" data-q="gemma 4">Gemma 4</button>
+          <button class="chip hf-preset" data-q="llama 3.3 gguf">Llama 3.3 GGUF</button>
+          <button class="chip hf-preset" data-q="onnx webgpu">ONNX WebGPU</button>
+        </div>
+
+        <div id="hf-error" class="error-box hidden"></div>
+        <div id="hf-repo-detail" class="card hidden" style="background: var(--surface-2);"></div>
+        <div id="hf-results" class="hf-grid"></div>
+      </div>
+    </section>
+
+    <!-- TAB 3: MEMORY ESTIMATOR -->
+    <section id="tab-estimator" class="panel">
+      <div class="two-col">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Model &amp; Hardware Parameters</h3>
+              <p class="subtitle">Auto-populated when you click "Send to Memory Estimator" from any inspected model.</p>
+            </div>
+          </div>
+
+          <div class="form-grid">
+            <div class="field">
+              <label for="est-hw">Hardware Preset</label>
+              <select id="est-hw"></select>
+            </div>
+            <div class="field">
+              <label for="est-quant">Quantization</label>
+              <select id="est-quant"></select>
+            </div>
+            <div class="field">
+              <label for="est-params">Parameters (Billions)</label>
+              <input id="est-params" type="number" step="0.1" min="0.1" value="8" />
+            </div>
+            <div class="field">
+              <label for="est-ctx">Context Length (tokens)</label>
+              <select id="est-ctx">
+                <option value="4096">4,096 (4K)</option>
+                <option value="8192">8,192 (8K)</option>
+                <option value="16384">16,384 (16K)</option>
+                <option value="32768" selected>32,768 (32K)</option>
+                <option value="65536">65,536 (64K)</option>
+                <option value="131072">131,072 (128K)</option>
+                <option value="262144">262,144 (256K)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="est-layers">Layers (block_count)</label>
+              <input id="est-layers" type="number" min="1" value="32" />
+            </div>
+            <div class="field">
+              <label for="est-kv-heads">KV Heads (GQA)</label>
+              <input id="est-kv-heads" type="number" min="1" value="8" />
+            </div>
+            <div class="field">
+              <label for="est-head-dim">Head Dim</label>
+              <input id="est-head-dim" type="number" min="16" step="16" value="128" />
+            </div>
+            <div class="field">
+              <label for="est-kv-dtype">KV Cache Precision</label>
+              <select id="est-kv-dtype">
+                <option value="fp16" selected>FP16 (Default)</option>
+                <option value="q8_0">Q8_0 (50% smaller)</option>
+                <option value="q4_0">Q4_0 (72% smaller)</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">Estimated Footprint &amp; Speed</h3>
+            <span id="est-status-badge" class="badge badge-green">Fits Comfortably</span>
+          </div>
+
+          <div id="est-metrics" class="metrics-grid"></div>
+
+          <div class="mem-bar-wrap" title="Memory breakdown vs usable RAM/VRAM">
+            <div id="bar-weights" class="mem-seg-weights"></div>
+            <div id="bar-kv" class="mem-seg-kv"></div>
+            <div id="bar-overhead" class="mem-seg-overhead"></div>
+          </div>
+
+          <div class="legend">
+            <span><i class="dot" style="background: var(--accent);"></i> Weights</span>
+            <span><i class="dot" style="background: var(--purple);"></i> KV Cache</span>
+            <span><i class="dot" style="background: var(--amber);"></i> Runtime Overhead</span>
+          </div>
+
+          <p id="est-note" class="subtitle" style="margin-top: 14px;"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: MODELFILE & CLI BUILDER -->
+    <section id="tab-builder" class="panel">
+      <div class="two-col">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Modelfile &amp; Conversion Config</h3>
+              <p class="subtitle">Generate an Ollama <code>Modelfile</code> and ready-to-run <code>model-convert</code> CLI commands.</p>
+            </div>
+          </div>
+
+          <div class="form-grid">
+            <div class="field">
+              <label for="mf-source">Source Path or HF Repo</label>
+              <input id="mf-source" type="text" value="./model.gguf" />
+            </div>
+            <div class="field">
+              <label for="mf-name">Target Ollama Name</label>
+              <input id="mf-name" type="text" value="my-model:latest" />
+            </div>
+            <div class="field">
+              <label for="mf-target">CLI Target Format (--to)</label>
+              <select id="mf-target">
+                <option value="ollama">ollama (Zero-copy GGUF / Auto)</option>
+                <option value="ollama-gguf">ollama-gguf (HF/MLX → GGUF → Ollama)</option>
+                <option value="ollama-mlx">ollama-mlx (HF → MLX → Ollama)</option>
+                <option value="mlx">mlx (Apple Silicon Metal)</option>
+                <option value="gguf">gguf (Quantize / Convert GGUF)</option>
+                <option value="lmstudio">lmstudio (~/.lmstudio/models)</option>
+                <option value="onnx">onnx (WebGPU / Transformers.js)</option>
+                <option value="safetensors">safetensors (Dequantize / Export)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="mf-quant">Quant / Bits</label>
+              <select id="mf-quant">
+                <option value="Q4_K_M">Q4_K_M (GGUF)</option>
+                <option value="Q5_K_M">Q5_K_M (GGUF)</option>
+                <option value="Q8_0">Q8_0 (GGUF)</option>
+                <option value="IQ4_NL">IQ4_NL (GGUF)</option>
+                <option value="4">4-bit (MLX)</option>
+                <option value="8">8-bit (MLX)</option>
+                <option value="16">16-bit BF16 (MLX)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="mf-ctx">Context Length (num_ctx)</label>
+              <input id="mf-ctx" type="number" value="32768" step="1024" />
+            </div>
+            <div class="field">
+              <label for="mf-temp">Temperature</label>
+              <input id="mf-temp" type="number" value="0.6" step="0.05" min="0" max="2" />
+            </div>
+            <div class="field">
+              <label for="mf-renderer">Ollama RENDERER (optional)</label>
+              <input id="mf-renderer" type="text" placeholder="e.g. qwen3.5, gemma4" />
+            </div>
+            <div class="field">
+              <label for="mf-parser">Ollama PARSER (optional)</label>
+              <input id="mf-parser" type="text" placeholder="e.g. qwen3.5" />
+            </div>
+          </div>
+
+          <div class="field" style="margin-top: 12px;">
+            <label>Capabilities</label>
+            <div class="cap-group">
+              <label><input type="checkbox" class="mf-cap" value="completion" checked /> completion</label>
+              <label><input type="checkbox" class="mf-cap" value="tools" /> tools</label>
+              <label><input type="checkbox" class="mf-cap" value="thinking" /> thinking</label>
+              <label><input type="checkbox" class="mf-cap" value="vision" /> vision</label>
+            </div>
+          </div>
+
+          <div class="field" style="margin-top: 10px;">
+            <label for="mf-system">System Prompt (optional)</label>
+            <textarea id="mf-system" placeholder="You are a concise, accurate assistant..."></textarea>
+          </div>
+        </div>
+
+        <div>
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">Generated Ollama Modelfile</h3>
+              <div class="btn-row">
+                <button id="btn-copy-mf" class="btn btn-sm" type="button">Copy</button>
+                <button id="btn-dl-mf" class="btn btn-sm btn-primary" type="button">Download Modelfile</button>
+              </div>
+            </div>
+            <pre id="out-modelfile" class="code-box"></pre>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3 class="card-title">CLI Commands</h3>
+              <button id="btn-copy-cli" class="btn btn-sm" type="button">Copy Command</button>
+            </div>
+            <pre id="out-cli" class="code-box"></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 5: LOCAL OLLAMA BRIDGE -->
+    <section id="tab-ollama" class="panel">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Local Ollama Bridge (Optional)</h3>
+            <p class="subtitle">Connect directly to your local Ollama API to list models and inspect Modelfiles. Requires <code>OLLAMA_ORIGINS="*"</code> if opened from GitHub Pages.</p>
+          </div>
+          <div class="btn-row">
+            <input id="ollama-url" type="text" value="http://localhost:11434" style="width: 220px;" />
+            <button id="btn-ollama-connect" class="btn btn-primary" type="button">Connect &amp; List</button>
+          </div>
+        </div>
+
+        <div id="ollama-error" class="error-box hidden"></div>
+        <div id="ollama-models" class="hf-grid"></div>
+        <div id="ollama-detail" class="card hidden" style="margin-top: 14px; background: var(--surface-2);"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    Model Bridge — Runs 100% client-side. No model weights are ever uploaded or tracked.
+    <a href="https://github.com/languel/model-bridge" target="_blank" rel="noopener">Source on GitHub</a>
+  </footer>
+
+  <div id="toast" class="toast">Copied!</div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
